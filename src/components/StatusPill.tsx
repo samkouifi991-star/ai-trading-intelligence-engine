@@ -29,6 +29,7 @@ const MODE_STYLE: Record<string, string> = {
   partial: "bg-watch/20 text-watch",
   sample: "bg-gray-600/20 text-gray-300",
   blocked: "bg-short/20 text-short",
+  unknown: "bg-gray-600/20 text-gray-500",
   "heuristic-fallback": "bg-gray-600/20 text-gray-300",
 };
 
@@ -37,6 +38,7 @@ const MODE_TITLE: Record<string, string> = {
   partial: "Live data, but degraded (see Live Data Status page)",
   sample: "Sample/demo data — not configured, or no attempt made yet",
   blocked: "A live fetch was attempted and failed — see Live Data Status page",
+  unknown: "No fetch attempted yet this session — see Live Data Status page",
   "heuristic-fallback": "OPENAI_API_KEY not set — using keyword heuristic instead of the LLM",
 };
 

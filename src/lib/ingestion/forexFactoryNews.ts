@@ -2,11 +2,13 @@ import { XMLParser } from "fast-xml-parser";
 import type { RawHeadline } from "../types";
 import type { NewsConnector } from "./types";
 import { hashString, mulberry32 } from "./seededRandom";
-import { withConnectorHealth } from "./connectorHealth";
+import { withConnectorHealth, resolveLiveOrFallback } from "./connectorHealth";
+import { fetchForexFactoryNewsDirect } from "./forexFactoryNewsDirect";
 
-const SOURCE_KEY = "news";
+const PRIMARY_KEY = "news:forexfactory";
+const SECONDARY_KEY = "news:forexlive";
 
-// ── Sample-mode fallback (used only when the live feed can't be reached) ──
+// ── Sample-mode fallback (used only when BOTH primary and secondary fail) ─
 
 const SAMPLE_HEADLINE_TEMPLATES = [
   "Iran threatens retaliation after strikes near Strait of Hormuz",
@@ -36,45 +38,68 @@ function timeBucketSeedAt(t: number): number {
   return hashString(`ffnews:${Math.floor(t / (18 * 60_000))}`);
 }
 
-class SampleNewsConnector implements NewsConnector {
-  async fetchLatest(sinceUtc?: string): Promise<RawHeadline[]> {
-    const since = sinceUtc ? new Date(sinceUtc).getTime() : Date.now() - 3 * 3600_000;
-    const headlines: RawHeadline[] = [];
-    const stepMs = 18 * 60_000;
-    let t = Math.ceil(since / stepMs) * stepMs;
-    const now = Date.now();
-    for (; t <= now; t += stepMs) {
-      const seed = timeBucketSeedAt(t);
-      const rand = mulberry32(seed);
-      const idx = Math.floor(rand() * SAMPLE_HEADLINE_TEMPLATES.length);
-      const headline = templateToHeadline(SAMPLE_HEADLINE_TEMPLATES[idx], rand);
-      headlines.push({
-        id: `sample-news-${t}`,
-        timestampUtc: new Date(t).toISOString(),
-        headline,
-        source: "Sample breaking news (live feed unreachable)",
-        sourceQuality: 82,
-      });
-    }
-    return headlines;
+function sampleHeadlines(sinceUtc?: string): RawHeadline[] {
+  const since = sinceUtc ? new Date(sinceUtc).getTime() : Date.now() - 3 * 3600_000;
+  const headlines: RawHeadline[] = [];
+  const stepMs = 18 * 60_000;
+  let t = Math.ceil(since / stepMs) * stepMs;
+  const now = Date.now();
+  for (; t <= now; t += stepMs) {
+    const rand = mulberry32(timeBucketSeedAt(t));
+    const idx = Math.floor(rand() * SAMPLE_HEADLINE_TEMPLATES.length);
+    headlines.push({
+      id: `sample-news-${t}`,
+      timestampUtc: new Date(t).toISOString(),
+      headline: templateToHeadline(SAMPLE_HEADLINE_TEMPLATES[idx], rand),
+      source: "Sample breaking news (development mode — live feeds unreachable)",
+      sourceQuality: 82,
+      contentType: "verified_news",
+    });
   }
+  return headlines;
 }
 
-// ── Live connector ──────────────────────────────────────────────────────
+// ── PRIMARY: direct Forex Factory scrape (or a licensed FF feed override) ──
+
+async function fetchPrimary(overrideUrl: string | undefined): Promise<RawHeadline[]> {
+  return withConnectorHealth(PRIMARY_KEY, async () => {
+    const items = overrideUrl ? await fetchJsonFeed(overrideUrl) : await fetchForexFactoryNewsDirect();
+    return { data: items };
+  });
+}
+
+async function fetchJsonFeed(url: string): Promise<RawHeadline[]> {
+  const res = await fetch(url, { headers: { accept: "application/json" }, cache: "no-store" });
+  if (!res.ok) throw new Error(`News feed HTTP ${res.status}`);
+  const rows = (await res.json()) as any[];
+  return rows.map(
+    (row): RawHeadline => ({
+      id: row.id,
+      timestampUtc: row.timestampUtc ?? row.publishedAt,
+      headline: row.headline ?? row.title,
+      body: row.body ?? row.summary,
+      source: row.source ?? "Forex Factory News (configured feed)",
+      sourceQuality: row.sourceQuality ?? 90,
+      url: row.url,
+      ffImpact: row.impact ?? row.ffImpact,
+      relatedCurrency: row.currency ?? row.relatedCurrency ?? null,
+      contentType: "verified_news",
+    })
+  );
+}
+
+// ── SECONDARY: ForexLive RSS — supplementary, never the primary source ────
 
 /**
- * Forex Factory has no public breaking-news API or RSS feed — its news wire
- * is only exposed through the logged-in website UI. Rather than scrape HTML
- * (fragile, ToS-gray, and liable to break silently), the default live
- * source here is ForexLive's public RSS feed: a real, keyless, forex/macro-
- * focused breaking-news wire covering the same kind of catalysts (central
- * banks, geopolitics, data surprises). It is intentionally NOT relabeled as
- * "Forex Factory" anywhere — the UI and connector health both say
- * "ForexLive" so this substitution is never hidden. Set
- * FOREX_FACTORY_NEWS_URL to point at a licensed Forex Factory feed (or any
- * other JSON headline API — see mapJsonRow below) if you have one.
+ * ForexLive's public RSS feed. Genuinely secondary: it supplements the
+ * primary Forex Factory source (concurrent, not fallback-on-failure-only —
+ * both are always attempted so a fast-moving story reported by either wire
+ * reaches the pipeline), lower sourceQuality, and — critically — not
+ * counted in the Day engine's required data-quality sources (see
+ * dataQuality/dataQualityEngine.ts's dayRequiredSources), so its health
+ * never gates a trade the way the primary source does.
  */
-const DEFAULT_NEWS_RSS_URL = "https://www.forexlive.com/feed/";
+const FOREXLIVE_RSS_URL = "https://www.forexlive.com/feed/";
 
 const xmlParser = new XMLParser({ ignoreAttributes: false, cdataPropName: "__cdata" });
 
@@ -112,86 +137,71 @@ export function mapRssItem(item: any, sourceLabel: string): RawHeadline | null {
     source: sourceLabel,
     sourceQuality: 78,
     url: textOf(item.link) || undefined,
+    contentType: "verified_news",
   };
 }
 
-async function fetchRssHeadlines(url: string, sourceLabel: string): Promise<RawHeadline[]> {
-  const res = await fetch(url, { headers: { accept: "application/rss+xml, application/xml, text/xml" }, cache: "no-store" });
-  if (!res.ok) throw new Error(`News feed HTTP ${res.status}`);
-  const xml = await res.text();
-  const parsed = xmlParser.parse(xml);
-  const items = parsed?.rss?.channel?.item;
-  if (!items) throw new Error("RSS feed did not contain any <item> entries");
-  const list = Array.isArray(items) ? items : [items];
-  return list
-    .map((item) => mapRssItem(item, sourceLabel))
-    .filter((h): h is RawHeadline => h !== null);
+async function fetchSecondary(): Promise<RawHeadline[]> {
+  return withConnectorHealth(SECONDARY_KEY, async () => {
+    const res = await fetch(FOREXLIVE_RSS_URL, { headers: { accept: "application/rss+xml, application/xml, text/xml" }, cache: "no-store" });
+    if (!res.ok) throw new Error(`ForexLive RSS HTTP ${res.status}`);
+    const xml = await res.text();
+    const parsed = xmlParser.parse(xml);
+    const items = parsed?.rss?.channel?.item;
+    if (!items) throw new Error("ForexLive RSS did not contain any <item> entries");
+    const list = Array.isArray(items) ? items : [items];
+    const headlines = list.map((item) => mapRssItem(item, "ForexLive (secondary)")).filter((h): h is RawHeadline => h !== null);
+    if (headlines.length === 0) return { data: headlines, partial: "Feed reachable but returned zero parseable headlines" };
+    return { data: headlines };
+  });
 }
 
-function mapJsonRow(row: any): RawHeadline {
-  return {
-    id: row.id,
-    timestampUtc: row.timestampUtc ?? row.publishedAt,
-    headline: row.headline ?? row.title,
-    body: row.body ?? row.summary,
-    source: row.source ?? "forex-factory-live",
-    sourceQuality: row.sourceQuality ?? 80,
-    url: row.url,
-  };
-}
+// ── Combined connector ──────────────────────────────────────────────────
 
-class LiveNewsConnector implements NewsConnector {
-  constructor(private readonly url: string, private readonly sourceLabel: string, private readonly format: "rss" | "json") {}
+/**
+ * Fetches PRIMARY (Forex Factory) and SECONDARY (ForexLive) concurrently
+ * and merges — this is the "same story from multiple sources must cluster
+ * into one story_id" hierarchy: both streams feed the same downstream
+ * clustering (see news/clustering.ts), which dedupes by headline
+ * similarity regardless of which wire reported it first. If BOTH fail,
+ * resolveLiveOrFallback governs dev/production behavior (sample fallback
+ * in dev; DataUnavailableError in production — see appMode.ts).
+ */
+class CombinedNewsConnector implements NewsConnector {
+  constructor(private readonly overrideUrl: string | undefined) {}
 
   async fetchLatest(sinceUtc?: string): Promise<RawHeadline[]> {
-    const all = await withConnectorHealth(SOURCE_KEY, async () => {
-      const headlines =
-        this.format === "rss" ? await fetchRssHeadlines(this.url, this.sourceLabel) : await this.fetchJson();
-      if (headlines.length === 0) {
-        return { data: headlines, partial: "Feed reachable but returned zero parseable headlines" };
-      }
-      return { data: headlines };
-    });
-    if (!sinceUtc) return all;
-    const sinceMs = new Date(sinceUtc).getTime();
-    return all.filter((h) => new Date(h.timestampUtc).getTime() > sinceMs);
-  }
+    return resolveLiveOrFallback(
+      PRIMARY_KEY,
+      async () => {
+        const [primaryResult, secondaryResult] = await Promise.allSettled([
+          fetchPrimary(this.overrideUrl),
+          fetchSecondary(),
+        ]);
 
-  private async fetchJson(): Promise<RawHeadline[]> {
-    const url = new URL(this.url);
-    const res = await fetch(url.toString(), { headers: { accept: "application/json" }, cache: "no-store" });
-    if (!res.ok) throw new Error(`News feed HTTP ${res.status}`);
-    const rows = (await res.json()) as any[];
-    return rows.map(mapJsonRow);
+        const merged: RawHeadline[] = [];
+        if (primaryResult.status === "fulfilled") merged.push(...primaryResult.value);
+        if (secondaryResult.status === "fulfilled") merged.push(...secondaryResult.value);
+
+        if (merged.length === 0) {
+          // Both failed (or both returned nothing) — propagate the primary's
+          // error so resolveLiveOrFallback's dev/production branch applies.
+          throw primaryResult.status === "rejected" ? primaryResult.reason : new Error("No headlines from any news source");
+        }
+
+        return filterSince(merged, sinceUtc);
+      },
+      () => filterSince(sampleHeadlines(sinceUtc), sinceUtc)
+    );
   }
 }
 
-/** Always attempts the real live news wire first; only falls back to sample
- * headlines if the fetch genuinely fails. See connectorHealth for how the
- * Live Data Status page distinguishes "live", "blocked" (fetch attempted and
- * failed), and "sample" (deliberately not configured — not applicable here
- * since a live default is always attempted). */
-class SmartNewsConnector implements NewsConnector {
-  private live: LiveNewsConnector;
-  private sample = new SampleNewsConnector();
-
-  constructor(url: string, sourceLabel: string, format: "rss" | "json") {
-    this.live = new LiveNewsConnector(url, sourceLabel, format);
-  }
-
-  async fetchLatest(sinceUtc?: string): Promise<RawHeadline[]> {
-    try {
-      return await this.live.fetchLatest(sinceUtc);
-    } catch {
-      return this.sample.fetchLatest(sinceUtc);
-    }
-  }
+function filterSince(headlines: RawHeadline[], sinceUtc?: string): RawHeadline[] {
+  if (!sinceUtc) return headlines;
+  const sinceMs = new Date(sinceUtc).getTime();
+  return headlines.filter((h) => new Date(h.timestampUtc).getTime() > sinceMs);
 }
 
 export function getNewsConnector(): { connector: NewsConnector; mode: "live" } {
-  const overrideUrl = process.env.FOREX_FACTORY_NEWS_URL;
-  if (overrideUrl) {
-    return { connector: new SmartNewsConnector(overrideUrl, "Configured news feed (FOREX_FACTORY_NEWS_URL)", "json"), mode: "live" };
-  }
-  return { connector: new SmartNewsConnector(DEFAULT_NEWS_RSS_URL, "ForexLive (real-time forex news wire)", "rss"), mode: "live" };
+  return { connector: new CombinedNewsConnector(process.env.FOREX_FACTORY_NEWS_URL), mode: "live" };
 }

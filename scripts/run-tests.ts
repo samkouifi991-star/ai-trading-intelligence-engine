@@ -11,9 +11,14 @@ import { decideFinalStatus } from "../src/lib/signals/validation";
 import { rankOpportunities } from "../src/lib/scoring/rank";
 import { getDaySessionPhase } from "../src/lib/time/session";
 import { mapFairEconomyRow, parseFeedNumber } from "../src/lib/ingestion/forexFactoryCalendar";
-import { parseYahooChartResponse, parseFredCsv } from "../src/lib/ingestion/marketData";
+import { parseFredCsv } from "../src/lib/ingestion/marketData";
+import { parseYahooChartResponse } from "../src/lib/marketdata/providers/yahoo";
+import { computeRatePressure } from "../src/lib/marketdata/ratePressure";
 import { mapRssItem } from "../src/lib/ingestion/forexFactoryNews";
-import type { TradeSignal } from "../src/lib/types";
+import { parseForexFactoryNewsHtml } from "../src/lib/ingestion/forexFactoryNewsDirect";
+import { buildReactionReport } from "../src/lib/pipeline/eventClock";
+import { saveEventClockSnapshot, upsertNewsStory } from "../src/lib/db/repository";
+import type { NewsStory, TradeSignal } from "../src/lib/types";
 
 let passed = 0;
 function test(name: string, fn: () => void) {
@@ -100,7 +105,7 @@ test("weights sum to a 0-100 composite with equal 100 inputs", () => {
 
 console.log("\ndeterministic validation gate (the LLM never decides TRADE/WATCH/NO_TRADE)");
 test("score < 70 is always NO_TRADE", () => {
-  const status = decideFinalStatus({
+  const { finalStatus } = decideFinalStatus({
     engine: "SWING",
     breakdown: computeSwingScore({
       macroRegimeScore: 50,
@@ -111,11 +116,12 @@ test("score < 70 is always NO_TRADE", () => {
       positioningFlowsScore: 50,
     }),
     crossAssetContradicted: false,
+    dataQualityScore: 100,
   });
-  assert.equal(status, "NO_TRADE");
+  assert.equal(finalStatus, "NO_TRADE");
 });
 test("score >= 80 with contradicted cross-asset confirmation is forced NO_TRADE, never TRADE", () => {
-  const status = decideFinalStatus({
+  const { finalStatus } = decideFinalStatus({
     engine: "SWING",
     breakdown: computeSwingScore({
       macroRegimeScore: 100,
@@ -126,13 +132,14 @@ test("score >= 80 with contradicted cross-asset confirmation is forced NO_TRADE,
       positioningFlowsScore: 100,
     }),
     crossAssetContradicted: true,
+    dataQualityScore: 100,
   });
-  assert.equal(status, "NO_TRADE");
+  assert.equal(finalStatus, "NO_TRADE");
 });
 test("DAY engine score >= 80 outside the 10:00-13:00 ET window downgrades to WATCH, never TRADE", () => {
   const outsideWindow = new Date("2026-08-31T08:00:00-04:00"); // 08:00 ET, prep phase
   assert.equal(getDaySessionPhase(outsideWindow), "prep");
-  const status = decideFinalStatus({
+  const { finalStatus } = decideFinalStatus({
     engine: "DAY",
     breakdown: computeDayTradeScore({
       newsCatalystScore: 100,
@@ -142,14 +149,15 @@ test("DAY engine score >= 80 outside the 10:00-13:00 ET window downgrades to WAT
       marketRegimeScore: 100,
     }),
     crossAssetContradicted: false,
+    dataQualityScore: 100,
     now: outsideWindow,
   });
-  assert.equal(status, "WATCH");
+  assert.equal(finalStatus, "WATCH");
 });
 test("DAY engine score >= 80 inside the 10:00-13:00 ET window with confirmation is TRADE", () => {
   const insideWindow = new Date("2026-08-31T11:00:00-04:00"); // 11:00 ET, active phase
   assert.equal(getDaySessionPhase(insideWindow), "active");
-  const status = decideFinalStatus({
+  const { finalStatus } = decideFinalStatus({
     engine: "DAY",
     breakdown: computeDayTradeScore({
       newsCatalystScore: 100,
@@ -159,9 +167,187 @@ test("DAY engine score >= 80 inside the 10:00-13:00 ET window with confirmation 
       marketRegimeScore: 100,
     }),
     crossAssetContradicted: false,
+    dataQualityScore: 100,
     now: insideWindow,
   });
-  assert.equal(status, "TRADE");
+  assert.equal(finalStatus, "TRADE");
+});
+
+console.log("\ndata quality gating (spec rule 6 — a 92 composite must not TRADE on 45/100 data quality)");
+test("data quality < 60 forces NO_TRADE even with a perfect composite score", () => {
+  const perfect = computeSwingScore({
+    macroRegimeScore: 100,
+    centralBankOutlookScore: 100,
+    fundamentalTrendScore: 100,
+    geopoliticalThemeScore: 100,
+    technicalTrendScore: 100,
+    positioningFlowsScore: 100,
+  });
+  const { finalStatus } = decideFinalStatus({ engine: "SWING", breakdown: perfect, crossAssetContradicted: false, dataQualityScore: 45 });
+  assert.equal(finalStatus, "NO_TRADE");
+});
+test("data quality 60-74 forces WATCH even with a perfect composite score", () => {
+  const perfect = computeSwingScore({
+    macroRegimeScore: 100,
+    centralBankOutlookScore: 100,
+    fundamentalTrendScore: 100,
+    geopoliticalThemeScore: 100,
+    technicalTrendScore: 100,
+    positioningFlowsScore: 100,
+  });
+  const { finalStatus } = decideFinalStatus({ engine: "SWING", breakdown: perfect, crossAssetContradicted: false, dataQualityScore: 65 });
+  assert.equal(finalStatus, "WATCH");
+});
+test("data quality 75-89 applies a confidence penalty but doesn't force a status", () => {
+  const perfect = computeSwingScore({
+    macroRegimeScore: 100,
+    centralBankOutlookScore: 100,
+    fundamentalTrendScore: 100,
+    geopoliticalThemeScore: 100,
+    technicalTrendScore: 100,
+    positioningFlowsScore: 100,
+  });
+  const { finalStatus, adjustedConfidence } = decideFinalStatus({
+    engine: "SWING",
+    breakdown: perfect,
+    crossAssetContradicted: false,
+    dataQualityScore: 80,
+  });
+  assert.ok(adjustedConfidence < perfect.composite, `expected penalty to reduce ${perfect.composite}, got ${adjustedConfidence}`);
+  assert.equal(finalStatus, "TRADE"); // still qualifies even after the mild penalty since it started at 100
+});
+
+console.log("\nintraday Treasury rate-pressure proxy (ZT/ZN futures, replaces FRED for Day-engine confirmation)");
+test("Treasury futures price DOWN reads as hawkish (positive) pressure", () => {
+  assert.ok(computeRatePressure(-0.15) > 15, "a falling futures price should read hawkish");
+});
+test("Treasury futures price UP reads as dovish (negative) pressure", () => {
+  assert.ok(computeRatePressure(0.15) < -15, "a rising futures price should read dovish");
+});
+test("rate pressure clamps to +/-100", () => {
+  assert.equal(computeRatePressure(-5), 100);
+  assert.equal(computeRatePressure(5), -100);
+});
+
+console.log("\ndirect Forex Factory news scraper (parser logic only — see forexFactoryNewsDirect.ts");
+console.log("for why real forexfactory.com markup can't be verified from this sandbox)");
+test("parseForexFactoryNewsHtml extracts headline/time/impact/currency/summary from a news-list row", () => {
+  const html = `<html><body><ul>
+    <li class="flexposts__item flexposts__item--impact-high">
+      <div class="flexposts__impact"><span class="impact-icon-high"></span></div>
+      <div class="flexposts__currency" title="USD">USD</div>
+      <a class="flexposts__title" href="/news/12345-fed-chair-says-additional-hikes-may-be-needed">Fed Chair says additional hikes may be needed</a>
+      <time datetime="2026-08-31T14:32:00Z">2h</time>
+      <p class="flexposts__excerpt">The Federal Reserve chair signaled openness to further tightening.</p>
+    </li>
+  </ul></body></html>`;
+  const items = parseForexFactoryNewsHtml(html);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].headline, "Fed Chair says additional hikes may be needed");
+  assert.equal(items[0].ffImpact, "high");
+  assert.equal(items[0].relatedCurrency, "USD");
+  assert.equal(items[0].timestampUtc, "2026-08-31T14:32:00.000Z");
+  assert.equal(items[0].url, "https://www.forexfactory.com/news/12345-fed-chair-says-additional-hikes-may-be-needed");
+  assert.ok(items[0].body?.includes("tightening"));
+  assert.equal(items[0].contentType, "verified_news");
+});
+test("parseForexFactoryNewsHtml returns an empty array (not a crash) on unrecognized markup", () => {
+  const items = parseForexFactoryNewsHtml("<html><body><p>completely different page structure</p></body></html>");
+  assert.equal(items.length, 0);
+});
+
+console.log("\nEvent Clock: prediction vs. confirmation reconciliation");
+test("buildReactionReport confirms a predicted move when the actual price change agrees in sign", () => {
+  const storyId = `test-story-${Date.now()}`;
+  const t0 = new Date().toISOString();
+
+  const story: NewsStory = {
+    storyId,
+    clusterKeyTerms: [],
+    headlines: [],
+    firstSeenUtc: t0,
+    lastUpdatedUtc: t0,
+    developmentCount: 1,
+    tradingHorizon: "day",
+    latestAnalysis: {
+      storyId,
+      timestampUtc: t0,
+      headline: "test hawkish CPI",
+      originalSource: "test",
+      sourceQuality: 90,
+      affectedCountries: [],
+      affectedCurrencies: [],
+      affectedCommodities: [],
+      affectedIndices: [],
+      eventType: "economic_data",
+      sourceAttribution: null,
+      confirmed: true,
+      novelty: "new_story",
+      severity: 80,
+      confidence: 80,
+      expectedDurationMinutes: 60,
+      inflationImpact: "higher",
+      growthImpact: "neutral",
+      interestRateImpact: "hawkish",
+      riskImpact: "neutral",
+      expectedAssetImpact: [{ symbol: "XAUUSD", score: -80 }], // predicted bearish gold
+      causalChain: [],
+    },
+  };
+  upsertNewsStory(story);
+  saveEventClockSnapshot({ storyId, t0Utc: t0, checkpoint: "T0", symbol: "XAUUSD", price: 2650 });
+  saveEventClockSnapshot({ storyId, t0Utc: t0, checkpoint: "T+5m", symbol: "XAUUSD", price: 2634 }); // -0.6%, bearish
+
+  const report = buildReactionReport(story);
+  const xau = report.confirmations.find((c) => c.symbol === "XAUUSD");
+  assert.ok(xau, "expected a confirmation entry for XAUUSD");
+  assert.equal(xau!.confirmed, true, "predicted -80 and actual -0.6% agree in sign, should confirm");
+});
+test("buildReactionReport does NOT confirm when actual price moves opposite the prediction", () => {
+  const storyId = `test-story-contra-${Date.now()}`;
+  const t0 = new Date().toISOString();
+
+  const story: NewsStory = {
+    storyId,
+    clusterKeyTerms: [],
+    headlines: [],
+    firstSeenUtc: t0,
+    lastUpdatedUtc: t0,
+    developmentCount: 1,
+    tradingHorizon: "day",
+    latestAnalysis: {
+      storyId,
+      timestampUtc: t0,
+      headline: "test hawkish CPI",
+      originalSource: "test",
+      sourceQuality: 90,
+      affectedCountries: [],
+      affectedCurrencies: [],
+      affectedCommodities: [],
+      affectedIndices: [],
+      eventType: "economic_data",
+      sourceAttribution: null,
+      confirmed: true,
+      novelty: "new_story",
+      severity: 80,
+      confidence: 80,
+      expectedDurationMinutes: 60,
+      inflationImpact: "higher",
+      growthImpact: "neutral",
+      interestRateImpact: "hawkish",
+      riskImpact: "neutral",
+      expectedAssetImpact: [{ symbol: "XAUUSD", score: -80 }], // predicted bearish gold
+      causalChain: [],
+    },
+  };
+  upsertNewsStory(story);
+  saveEventClockSnapshot({ storyId, t0Utc: t0, checkpoint: "T0", symbol: "XAUUSD", price: 2650 });
+  saveEventClockSnapshot({ storyId, t0Utc: t0, checkpoint: "T+5m", symbol: "XAUUSD", price: 2666 }); // +0.6%, bullish
+
+  const report = buildReactionReport(story);
+  const xau = report.confirmations.find((c) => c.symbol === "XAUUSD");
+  assert.ok(xau);
+  assert.equal(xau!.confirmed, false, "predicted -80 but actual +0.6% disagrees, should NOT confirm");
 });
 
 console.log("\nopportunity ranking / correlation de-duplication");
@@ -171,11 +357,15 @@ test("a lower-ranked correlated instrument (ES vs NQ) is suppressed", () => {
     direction: "SHORT",
     catalyst: "test",
     newsSummary: "test",
+    newsImpactScore: null,
+    marketConfirmationScore: null,
     economicSurpriseScore: null,
     fundamentalScore: null,
     technicalScore: null,
     crossMarketConfirmationScore: null,
     marketRegimeScore: null,
+    dataQualityScore: 100,
+    dataQualityReason: null,
     entryZone: null,
     invalidation: null,
     target1: null,

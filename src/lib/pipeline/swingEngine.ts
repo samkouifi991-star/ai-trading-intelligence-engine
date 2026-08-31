@@ -1,15 +1,15 @@
 import { TRADABLE_UNIVERSE } from "../universe";
 import { getRecentStories, saveSignal } from "../db/repository";
 import { decayedSeverity, currentDecayFactor } from "../news/decay";
-import { getCurrentRegime } from "./regimePipeline";
 import { getMarketDataConnector } from "../ingestion/marketData";
 import { buildTechnicalReadout } from "../technical/indicators";
 import { checkCrossAssetConfirmation } from "../crossAsset/confirmationEngine";
 import { computeSwingScore } from "../scoring/swingScore";
-import { marketRegimeScore as regimeScoreOf } from "../regime/regimeEngine";
+import { computeMacroRegime, marketRegimeScore as regimeScoreOf } from "../regime/regimeEngine";
 import { buildSignal } from "../signals/signalBuilder";
 import { rankOpportunities } from "../scoring/rank";
-import type { Direction, NewsStory, TradeSignal } from "../types";
+import { computeDataQualityScore, swingRequiredSources } from "../dataQuality/dataQualityEngine";
+import type { Direction, MacroRegime, MacroSnapshot, NewsStory, TradeSignal } from "../types";
 
 const MIN_DECAYED_SEVERITY_TO_CONSIDER = 15;
 
@@ -24,8 +24,25 @@ export interface SwingEngineResult {
 }
 
 export async function runSwingEngine(now: Date = new Date()): Promise<SwingEngineResult> {
-  const { regime } = await getCurrentRegime();
   const { connector: marketData } = getMarketDataConnector();
+
+  let macro: MacroSnapshot;
+  let regime: MacroRegime;
+  try {
+    macro = await marketData.getMacroSnapshot();
+    regime = computeMacroRegime(macro);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return {
+      regimeSummary: `Regime unavailable: ${reason}`,
+      centralBankBias: "unavailable",
+      activeThemes: [],
+      candidates: [],
+      ranked: [],
+      suppressed: [],
+      noIdeaReasons: TRADABLE_UNIVERSE.map((i) => `${i.symbol}: required macro data unavailable (${reason}).`),
+    };
+  }
 
   const allStories = getRecentStories(80);
   const swingStories = allStories.filter(
@@ -65,12 +82,11 @@ export async function runSwingEngine(now: Date = new Date()): Promise<SwingEngin
     let snapshot;
     try {
       snapshot = await marketData.getSnapshot(instrument.symbol);
-    } catch {
-      noIdeaReasons.push(`${instrument.symbol}: market data unavailable.`);
+    } catch (err) {
+      noIdeaReasons.push(`${instrument.symbol}: market data unavailable (${err instanceof Error ? err.message : String(err)}).`);
       continue;
     }
     const technical = buildTechnicalReadout(snapshot);
-    const macro = await marketData.getMacroSnapshot();
     const crossAssetCheck = checkCrossAssetConfirmation({
       symbol: instrument.symbol,
       predictedDirection: direction,
@@ -95,6 +111,8 @@ export async function runSwingEngine(now: Date = new Date()): Promise<SwingEngin
       (a, b) => decayedSeverity(b, "swing", now) - decayedSeverity(a, "swing", now)
     )[0];
 
+    const dataQuality = computeDataQualityScore(swingRequiredSources(instrument.symbol));
+
     const signal = buildSignal({
       engine: "SWING",
       instrument: instrument.symbol,
@@ -107,6 +125,8 @@ export async function runSwingEngine(now: Date = new Date()): Promise<SwingEngin
       crossAssetCheck,
       story: strongest,
       upcomingRisks: [],
+      newsImpactScore: aggregateImpact,
+      dataQualityScore: dataQuality.score,
       now,
     });
 

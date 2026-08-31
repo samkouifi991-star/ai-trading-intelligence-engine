@@ -24,6 +24,10 @@ export interface BuildSignalParams {
   crossAssetCheck: CrossAssetCheck | null;
   story: NewsStory | null;
   upcomingRisks: string[];
+  /** Signed -100..100 predicted asset-impact score from the news
+   * understanding engine, if this signal originated from a story. */
+  newsImpactScore?: number | null;
+  dataQualityScore: number;
   now?: Date;
 }
 
@@ -31,29 +35,34 @@ export function buildSignal(params: BuildSignalParams): TradeSignal {
   const now = params.now ?? new Date();
   const { entryZone, invalidation, target1, target2 } = computeLevels(params);
 
-  const finalStatus = decideFinalStatus({
+  const { finalStatus, adjustedConfidence, dataQualityReason } = decideFinalStatus({
     engine: params.engine,
     breakdown: params.breakdown,
     crossAssetContradicted: params.crossAssetCheck?.contradicted ?? false,
+    dataQualityScore: params.dataQualityScore,
     now,
   });
 
-  const { reasonsFor, reasonsAgainst } = buildReasons(params);
+  const { reasonsFor, reasonsAgainst } = buildReasons(params, dataQualityReason);
 
   return {
     id: randomUUID(),
     engine: params.engine,
     instrument: params.instrument,
     direction: params.direction,
-    confidence: params.breakdown.composite,
+    confidence: adjustedConfidence,
     catalyst: params.catalyst,
     newsSummary: params.newsSummary,
+    newsImpactScore: params.newsImpactScore ?? null,
+    marketConfirmationScore: params.crossAssetCheck?.confirmationDirectionScore ?? null,
     economicSurpriseScore: "economicSurpriseScore" in params.breakdown ? params.breakdown.economicSurpriseScore : null,
     fundamentalScore: "fundamentalTrendScore" in params.breakdown ? params.breakdown.fundamentalTrendScore : null,
     technicalScore: pickTechnicalScore(params.breakdown),
     crossMarketConfirmationScore:
       "crossMarketConfirmationScore" in params.breakdown ? params.breakdown.crossMarketConfirmationScore : null,
     marketRegimeScore: "marketRegimeScore" in params.breakdown ? params.breakdown.marketRegimeScore : null,
+    dataQualityScore: params.dataQualityScore,
+    dataQualityReason,
     entryZone,
     invalidation,
     target1,
@@ -121,9 +130,11 @@ function computeExpiration(engine: Engine, now: Date): Date {
   return new Date(now.getTime() + 14 * 86_400_000);
 }
 
-function buildReasons(params: BuildSignalParams): { reasonsFor: string[]; reasonsAgainst: string[] } {
+function buildReasons(params: BuildSignalParams, dataQualityReason: string | null): { reasonsFor: string[]; reasonsAgainst: string[] } {
   const reasonsFor: string[] = [];
   const reasonsAgainst: string[] = [];
+
+  if (dataQualityReason) reasonsAgainst.push(dataQualityReason);
 
   if (params.catalyst) reasonsFor.push(`Catalyst: ${params.catalyst}`);
 

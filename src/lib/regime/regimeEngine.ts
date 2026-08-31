@@ -3,14 +3,16 @@ import type { MacroRegime, MacroSnapshot } from "../types";
 const VIX_RISK_OFF_CHANGE = 3; // %
 const VIX_RISK_OFF_LEVEL = 20;
 const VIX_RISK_ON_LEVEL = 14;
-const YIELD_MOVE_THRESHOLD_BPS = 3;
+const RATE_PRESSURE_THRESHOLD = 15; // matches ratePressureLabel's neutral band
 const DXY_MOVE_THRESHOLD_PCT = 0.15;
 
 /**
- * Deterministic macro-regime read from the reference series (DXY, US2Y,
- * US10Y, VIX). This is intentionally a transparent rules engine, not an ML
- * model or LLM guess — every downstream consumer (surprise-engine regime
- * adjustment, day/swing scoring) needs a regime read it can audit.
+ * Deterministic macro-regime read from the reference series (DXY, VIX, and
+ * the intraday Treasury-futures-derived 2Y/10Y rate-pressure proxies — NOT
+ * FRED's daily yields, which cannot support an intraday regime read). This
+ * is intentionally a transparent rules engine, not an ML model or LLM
+ * guess — every downstream consumer (surprise-engine regime adjustment,
+ * day/swing scoring) needs a regime read it can audit.
  */
 export function computeMacroRegime(macro: MacroSnapshot): MacroRegime {
   const vixRising = macro.vixChangePct > VIX_RISK_OFF_CHANGE || macro.vix > VIX_RISK_OFF_LEVEL;
@@ -18,12 +20,12 @@ export function computeMacroRegime(macro: MacroSnapshot): MacroRegime {
 
   const risk: MacroRegime["risk"] = vixRising ? "risk_off" : vixFalling ? "risk_on" : "neutral";
 
-  const shortEndHawkish = macro.us2yChangeBps > YIELD_MOVE_THRESHOLD_BPS;
-  const shortEndDovish = macro.us2yChangeBps < -YIELD_MOVE_THRESHOLD_BPS;
+  const shortEndHawkish = macro.us2yRatePressure > RATE_PRESSURE_THRESHOLD;
+  const shortEndDovish = macro.us2yRatePressure < -RATE_PRESSURE_THRESHOLD;
   const rateBias: MacroRegime["rateBias"] = shortEndHawkish ? "hawkish" : shortEndDovish ? "dovish" : "neutral";
 
-  const longEndRising = macro.us10yChangeBps > YIELD_MOVE_THRESHOLD_BPS;
-  const longEndFalling = macro.us10yChangeBps < -YIELD_MOVE_THRESHOLD_BPS;
+  const longEndRising = macro.us10yRatePressure > RATE_PRESSURE_THRESHOLD;
+  const longEndFalling = macro.us10yRatePressure < -RATE_PRESSURE_THRESHOLD;
   const inflation: MacroRegime["inflation"] = longEndRising ? "rising" : longEndFalling ? "falling" : "stable";
 
   let growth: MacroRegime["growth"] = "unclear";
@@ -64,7 +66,12 @@ function buildSummary(params: {
     `Inflation expectations: ${inflation}`,
     `Growth: ${growth}`,
   ];
-  return `${parts.join(" · ")} (DXY ${macro.dxy.toFixed(2)} ${macro.dxyChangePct >= 0 ? "+" : ""}${macro.dxyChangePct.toFixed(2)}%, US2Y ${macro.us2y.toFixed(2)}% ${macro.us2yChangeBps >= 0 ? "+" : ""}${macro.us2yChangeBps.toFixed(1)}bp, US10Y ${macro.us10y.toFixed(2)}% ${macro.us10yChangeBps >= 0 ? "+" : ""}${macro.us10yChangeBps.toFixed(1)}bp, VIX ${macro.vix.toFixed(1)} ${macro.vixChangePct >= 0 ? "+" : ""}${macro.vixChangePct.toFixed(1)}%)`;
+  const sign = (n: number) => (n >= 0 ? "+" : "");
+  const dailyYields =
+    macro.us2yDaily !== null && macro.us10yDaily !== null
+      ? `, daily FRED context US2Y ${macro.us2yDaily.toFixed(2)}%/US10Y ${macro.us10yDaily.toFixed(2)}%`
+      : "";
+  return `${parts.join(" · ")} (DXY ${macro.dxy.toFixed(2)} ${sign(macro.dxyChangePct)}${macro.dxyChangePct.toFixed(2)}%, 2Y rate pressure ${sign(macro.us2yRatePressure)}${macro.us2yRatePressure}, 10Y rate pressure ${sign(macro.us10yRatePressure)}${macro.us10yRatePressure}, VIX ${macro.vix.toFixed(1)} ${sign(macro.vixChangePct)}${macro.vixChangePct.toFixed(1)}%${dailyYields})`;
 }
 
 /** 0-100 score for the "market regime" slice of both the day and swing

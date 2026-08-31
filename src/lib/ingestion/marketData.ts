@@ -1,12 +1,22 @@
 import type { MacroSnapshot, MarketSnapshot, OhlcvBar } from "../types";
 import type { MarketDataConnector } from "./types";
 import { hashString, mulberry32 } from "./seededRandom";
-import { withConnectorHealth } from "./connectorHealth";
+import { recordConnectorHealth, resolveLiveOrFallback } from "./connectorHealth";
+import { isProductionMode, DataUnavailableError } from "../config/appMode";
+import { getPrimaryProvider, getFallbackProvider } from "../marketdata/registry";
+import { providerSymbol, isGlobalSessionOpen } from "../marketdata/instruments";
+import { computeRatePressure } from "../marketdata/ratePressure";
 
-// ── Sample-mode fallback (used only when a live fetch fails) ──────────────
+/**
+ * This is a thin adapter over the MarketDataProvider registry
+ * (src/lib/marketdata/*) that preserves the existing MarketDataConnector
+ * shape (getSnapshot/getMacroSnapshot) every scoring engine already depends
+ * on — so switching providers, or adding a new one, never touches
+ * src/lib/scoring, src/lib/crossAsset, or src/lib/technical.
+ */
 
-/** Anchor prices sample-mode random walks are built around — purely to make
- * fallback data look plausible, never used by the live path. */
+// ── Sample-mode fallback (development only — see appMode.ts) ──────────────
+
 const ANCHOR_PRICE: Record<string, number> = {
   XAUUSD: 2650,
   ES: 5700,
@@ -74,110 +84,136 @@ function round(n: number, d: number): number {
 function sampleSnapshot(symbol: string): MarketSnapshot {
   const bars = buildSampleBars(symbol, 120, 1);
   const last = bars[bars.length - 1]?.close ?? ANCHOR_PRICE[symbol] ?? 0;
+  recordConnectorHealth(`marketData:${symbol}`, "sample", "development mode — live fetch failed, using sample fallback");
   return { symbol, priceUtc: new Date().toISOString(), last, vwap: computeVwap(bars), bars };
 }
 
-function sampleMacroSnapshot(): MacroSnapshot {
+function sampleRef(key: string): { value: number; changePct: number } {
   const now = Date.now();
   const bucket = Math.floor(now / 60_000);
-  const rand = mulberry32(hashString(`macro:${bucket}`));
-  return {
-    timeUtc: new Date(now).toISOString(),
-    dxy: round(104 + (rand() - 0.5) * 1.2, 2),
-    us2y: round(4.3 + (rand() - 0.5) * 0.2, 3),
-    us10y: round(4.1 + (rand() - 0.5) * 0.2, 3),
-    vix: round(15 + rand() * 6, 2),
-    dxyChangePct: round((rand() - 0.5) * 0.6, 2),
-    us2yChangeBps: round((rand() - 0.5) * 8, 1),
-    us10yChangeBps: round((rand() - 0.5) * 8, 1),
-    vixChangePct: round((rand() - 0.5) * 6, 2),
-  };
+  const rand = mulberry32(hashString(`macro:${key}:${bucket}`));
+  recordConnectorHealth(`marketData:${key}`, "sample", "development mode — live fetch failed, using sample fallback");
+  if (key === "DXY") return { value: round(104 + (rand() - 0.5) * 1.2, 2), changePct: round((rand() - 0.5) * 0.6, 2) };
+  if (key === "VIX") return { value: round(15 + rand() * 6, 2), changePct: round((rand() - 0.5) * 6, 2) };
+  return { value: 0, changePct: round((rand() - 0.5) * 0.15, 3) }; // rate-pressure proxies only need changePct
 }
 
-// ── Live connector: Yahoo Finance (tradables + DXY + VIX) + FRED (yields) ──
+// ── Live: per-instrument price snapshot (primary provider, Yahoo fallback) ─
 
-/**
- * Yahoo Finance's public chart endpoint requires no API key and is the
- * de-facto standard free source for exactly this kind of build. Treasury
- * yields come from FRED (Federal Reserve Economic Data) instead — its public
- * CSV export is also keyless and is the authoritative government source,
- * though daily-resolution (yields settle once/day), not tick-by-tick.
- */
-const YAHOO_SYMBOL: Record<string, string> = {
-  XAUUSD: "XAUUSD=X",
-  ES: "ES=F",
-  NQ: "NQ=F",
-  WTI: "CL=F",
-  EURUSD: "EURUSD=X",
-  GBPUSD: "GBPUSD=X",
-  USDJPY: "USDJPY=X",
-  USDCAD: "USDCAD=X",
-  AUDUSD: "AUDUSD=X",
-  DXY: "DX-Y.NYB",
-  VIX: "^VIX",
-};
+async function attemptLiveSnapshot(symbol: string): Promise<MarketSnapshot> {
+  const start = Date.now();
+  const primary = getPrimaryProvider();
+  const fallback = getFallbackProvider();
+  const providers = primary.name === fallback.name ? [primary] : [primary, fallback];
+  let lastErr: unknown = new Error("no market data provider configured");
 
-interface YahooChartResult {
-  last: number;
-  previousClose: number;
-  bars: OhlcvBar[];
-}
-
-/** Parses one Yahoo Finance `/v8/finance/chart/{symbol}` response. Exported
- * for unit testing against a realistic hand-built fixture matching the
- * endpoint's documented/observed schema — this cannot be exercised against
- * the live endpoint from inside a network-restricted environment. */
-export function parseYahooChartResponse(json: any, symbolForError: string): YahooChartResult {
-  const chartError = json?.chart?.error;
-  if (chartError) throw new Error(`Yahoo Finance error for ${symbolForError}: ${JSON.stringify(chartError)}`);
-  const result = json?.chart?.result?.[0];
-  if (!result) throw new Error(`Yahoo Finance returned no result for ${symbolForError}`);
-
-  const meta = result.meta ?? {};
-  const timestamps: number[] = result.timestamp ?? [];
-  const quote = result.indicators?.quote?.[0] ?? {};
-  const opens: (number | null)[] = quote.open ?? [];
-  const highs: (number | null)[] = quote.high ?? [];
-  const lows: (number | null)[] = quote.low ?? [];
-  const closes: (number | null)[] = quote.close ?? [];
-  const volumes: (number | null)[] = quote.volume ?? [];
-
-  const bars: OhlcvBar[] = [];
-  for (let i = 0; i < timestamps.length; i++) {
-    if (opens[i] == null || highs[i] == null || lows[i] == null || closes[i] == null) continue; // Yahoo pads illiquid minutes with nulls
-    bars.push({
-      timeUtc: new Date(timestamps[i] * 1000).toISOString(),
-      open: opens[i] as number,
-      high: highs[i] as number,
-      low: lows[i] as number,
-      close: closes[i] as number,
-      volume: (volumes[i] as number) ?? 0,
-    });
+  for (const provider of providers) {
+    try {
+      const sym = providerSymbol(symbol, provider.name as "yahoo" | "twelvedata");
+      const bars = await provider.getCandles(sym);
+      const last = bars[bars.length - 1]?.close;
+      if (last === undefined) throw new Error(`${provider.name} returned no bars for ${symbol}`);
+      const health = provider.getHealth();
+      const partial = bars.length < 10;
+      recordConnectorHealth(
+        `marketData:${symbol}`,
+        partial ? "partial" : "live",
+        partial ? `${provider.name}: only ${bars.length} bars returned` : `${provider.name}: ok`,
+        { latencyMs: Date.now() - start, realtime: health.realtime, streamingMode: health.streamingMode, marketOpen: isGlobalSessionOpen() }
+      );
+      return { symbol, priceUtc: new Date().toISOString(), last, vwap: computeVwap(bars) ?? last, bars };
+    } catch (err) {
+      lastErr = err;
+    }
   }
 
-  const last = meta.regularMarketPrice ?? bars[bars.length - 1]?.close;
-  if (last === undefined || last === null) throw new Error(`Yahoo Finance returned no usable price for ${symbolForError}`);
-  const previousClose = meta.previousClose ?? meta.chartPreviousClose ?? last;
-
-  return { last, previousClose, bars };
+  recordConnectorHealth(`marketData:${symbol}`, "blocked", lastErr instanceof Error ? lastErr.message : String(lastErr), {
+    latencyMs: Date.now() - start,
+    marketOpen: isGlobalSessionOpen(),
+  });
+  throw lastErr;
 }
 
-async function fetchYahooChart(yahooSymbol: string): Promise<YahooChartResult> {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?interval=1m&range=1d`;
-  const res = await fetch(url, {
-    headers: { "User-Agent": "Mozilla/5.0 (compatible; ai-trading-intelligence-engine/1.0)", accept: "application/json" },
-    cache: "no-store",
+// ── Live: reference series (DXY / VIX / Treasury-futures rate proxies) ────
+
+export type RefKey = "DXY" | "VIX" | "US2Y_PROXY" | "US10Y_PROXY";
+
+/** Latest price for a reference series (DXY/VIX/Treasury-futures rate
+ * proxies) — used by the Event Clock (pipeline/eventClock.ts) to snapshot
+ * these alongside tradable instruments at each checkpoint. Throws on
+ * failure rather than falling back to sample data; the Event Clock treats a
+ * missed snapshot as "not captured this tick," not a fabricated price. */
+export async function getReferencePrice(key: RefKey): Promise<number> {
+  const { value } = await attemptRefSeries(key);
+  return value;
+}
+
+async function attemptRefSeries(key: RefKey): Promise<{ value: number; changePct: number }> {
+  const start = Date.now();
+  const primary = getPrimaryProvider();
+  const fallback = getFallbackProvider();
+  const providers = primary.name === fallback.name ? [primary] : [primary, fallback];
+  let lastErr: unknown = new Error(`no market data provider configured for ${key}`);
+
+  for (const provider of providers) {
+    try {
+      const sym = providerSymbol(key, provider.name as "yahoo" | "twelvedata");
+      const bars = await provider.getCandles(sym);
+      if (bars.length === 0) throw new Error(`${provider.name} returned no bars for ${key}`);
+      const last = bars[bars.length - 1].close;
+      const first = bars[0].open;
+      const changePct = first ? ((last - first) / first) * 100 : 0;
+      const health = provider.getHealth();
+      recordConnectorHealth(`marketData:${key}`, "live", `${provider.name}: ok`, {
+        latencyMs: Date.now() - start,
+        realtime: health.realtime,
+        streamingMode: health.streamingMode,
+        marketOpen: isGlobalSessionOpen(),
+      });
+      return { value: round(last, key === "VIX" || key === "DXY" ? 2 : 3), changePct: round(changePct, 3) };
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+
+  recordConnectorHealth(`marketData:${key}`, "blocked", lastErr instanceof Error ? lastErr.message : String(lastErr), {
+    latencyMs: Date.now() - start,
+    marketOpen: isGlobalSessionOpen(),
   });
-  if (!res.ok) throw new Error(`Yahoo Finance HTTP ${res.status} for ${yahooSymbol}`);
-  const json = await res.json();
-  return parseYahooChartResponse(json, yahooSymbol);
+  throw lastErr;
+}
+
+// ── Live: FRED daily Treasury yields (macro context only — never used for
+// intraday Day-engine confirmation, see MacroSnapshot's doc comment) ───────
+
+async function fetchFredSeries(seriesId: string): Promise<{ latest: { date: string; value: number }; previous: { date: string; value: number } }> {
+  const start = Date.now();
+  const sourceKey = `marketData:FRED_${seriesId}`;
+  try {
+    const url = `https://fred.stlouisfed.org/graph/fredgraph.csv?id=${encodeURIComponent(seriesId)}`;
+    const res = await fetch(url, { headers: { accept: "text/csv" }, cache: "no-store" });
+    if (!res.ok) throw new Error(`FRED HTTP ${res.status} for ${seriesId}`);
+    const csv = await res.text();
+    const result = parseFredCsv(csv);
+    const ageHours = (Date.now() - new Date(result.latest.date).getTime()) / 3_600_000;
+    recordConnectorHealth(
+      sourceKey,
+      ageHours > 96 ? "partial" : "live",
+      ageHours > 96 ? `Latest observation ${result.latest.date} is ${Math.round(ageHours)}h old` : "ok",
+      { latencyMs: Date.now() - start, realtime: false, streamingMode: "polling" }
+    );
+    return result;
+  } catch (err) {
+    recordConnectorHealth(sourceKey, "blocked", err instanceof Error ? err.message : String(err), { latencyMs: Date.now() - start });
+    throw err;
+  }
 }
 
 /** FRED's `fredgraph.csv` export: `DATE,<SERIES_ID>\n2026-08-28,4.18\n...`
  * with `.` for a missing/holiday value. Exported for unit testing against a
  * realistic fixture. */
 export function parseFredCsv(csv: string): { latest: { date: string; value: number }; previous: { date: string; value: number } } {
-  const lines = csv.trim().split("\n").slice(1); // skip header row
+  const lines = csv.trim().split("\n").slice(1);
   const rows: { date: string; value: number }[] = [];
   for (const line of lines) {
     const [date, raw] = line.split(",");
@@ -191,147 +227,65 @@ export function parseFredCsv(csv: string): { latest: { date: string; value: numb
   return { latest, previous };
 }
 
-async function fetchFredSeries(seriesId: string): Promise<{ latest: { date: string; value: number }; previous: { date: string; value: number } }> {
-  const url = `https://fred.stlouisfed.org/graph/fredgraph.csv?id=${encodeURIComponent(seriesId)}`;
-  const res = await fetch(url, { headers: { accept: "text/csv" }, cache: "no-store" });
-  if (!res.ok) throw new Error(`FRED HTTP ${res.status} for ${seriesId}`);
-  const csv = await res.text();
-  return parseFredCsv(csv);
-}
+// ── The adapter ─────────────────────────────────────────────────────────
 
-class LiveMarketDataConnector implements MarketDataConnector {
+class SmartMarketDataConnector implements MarketDataConnector {
   async getSnapshot(symbol: string): Promise<MarketSnapshot> {
-    const yahooSymbol = YAHOO_SYMBOL[symbol];
-    if (!yahooSymbol) throw new Error(`No live symbol mapping for ${symbol}`);
-
-    return withConnectorHealth(`marketData:${symbol}`, async () => {
-      const chart = await fetchYahooChart(yahooSymbol);
-      const snapshot: MarketSnapshot = {
-        symbol,
-        priceUtc: new Date().toISOString(),
-        last: chart.last,
-        vwap: computeVwap(chart.bars) ?? chart.last,
-        bars: chart.bars,
-      };
-      if (chart.bars.length < 10) {
-        return { data: snapshot, partial: `Only ${chart.bars.length} intraday bars returned — technical indicators will be noisy` };
-      }
-      return { data: snapshot };
-    });
+    return resolveLiveOrFallback(
+      `marketData:${symbol}`,
+      () => attemptLiveSnapshot(symbol),
+      () => sampleSnapshot(symbol)
+    );
   }
 
   async getMacroSnapshot(): Promise<MacroSnapshot> {
-    const [dxy, vix, us2y, us10y] = await Promise.allSettled([
-      this.fetchYahooRef("DXY"),
-      this.fetchYahooRef("VIX"),
-      this.fetchFredRef("US2Y", "DGS2"),
-      this.fetchFredRef("US10Y", "DGS10"),
+    const [dxyR, vixR, r2yR, r10yR] = await Promise.allSettled([
+      attemptRefSeries("DXY"),
+      attemptRefSeries("VIX"),
+      attemptRefSeries("US2Y_PROXY"),
+      attemptRefSeries("US10Y_PROXY"),
     ]);
+    const results: Record<RefKey, PromiseSettledResult<{ value: number; changePct: number }>> = {
+      DXY: dxyR,
+      VIX: vixR,
+      US2Y_PROXY: r2yR,
+      US10Y_PROXY: r10yR,
+    };
+    const failedKeys = (Object.keys(results) as RefKey[]).filter((k) => results[k].status === "rejected");
 
-    const fallback = sampleMacroSnapshot();
-    const dxyVal = dxy.status === "fulfilled" ? dxy.value : null;
-    const vixVal = vix.status === "fulfilled" ? vix.value : null;
-    const us2yVal = us2y.status === "fulfilled" ? us2y.value : null;
-    const us10yVal = us10y.status === "fulfilled" ? us10y.value : null;
+    // DXY/VIX/rate-pressure proxies are the Day engine's required
+    // cross-market confirmation inputs — in production, if any are
+    // unavailable, fail loudly rather than silently substitute fake data
+    // (spec rule 5). The caller (day/swing engines) catches this and marks
+    // that tick's evaluations NO_TRADE with an explicit reason.
+    if (failedKeys.length > 0 && isProductionMode()) {
+      throw new DataUnavailableError("marketData:macro", new Error(`Unavailable in production: ${failedKeys.join(", ")}`));
+    }
+
+    const pick = (k: RefKey) => (results[k].status === "fulfilled" ? (results[k] as PromiseFulfilledResult<{ value: number; changePct: number }>).value : sampleRef(k));
+    const dxy = pick("DXY");
+    const vix = pick("VIX");
+    const r2y = pick("US2Y_PROXY");
+    const r10y = pick("US10Y_PROXY");
+
+    const [fred2y, fred10y] = await Promise.allSettled([fetchFredSeries("DGS2"), fetchFredSeries("DGS10")]);
 
     return {
       timeUtc: new Date().toISOString(),
-      dxy: dxyVal ? dxyVal.value : fallback.dxy,
-      dxyChangePct: dxyVal ? dxyVal.changePct : fallback.dxyChangePct,
-      vix: vixVal ? vixVal.value : fallback.vix,
-      vixChangePct: vixVal ? vixVal.changePct : fallback.vixChangePct,
-      us2y: us2yVal ? us2yVal.value : fallback.us2y,
-      us2yChangeBps: us2yVal ? us2yVal.changeBps : fallback.us2yChangeBps,
-      us10y: us10yVal ? us10yVal.value : fallback.us10y,
-      us10yChangeBps: us10yVal ? us10yVal.changeBps : fallback.us10yChangeBps,
+      dxy: dxy.value,
+      dxyChangePct: dxy.changePct,
+      vix: vix.value,
+      vixChangePct: vix.changePct,
+      us2yRatePressure: computeRatePressure(r2y.changePct),
+      us10yRatePressure: computeRatePressure(r10y.changePct),
+      us2yDaily: fred2y.status === "fulfilled" ? fred2y.value.latest.value : null,
+      us10yDaily: fred10y.status === "fulfilled" ? fred10y.value.latest.value : null,
+      us2yDailyChangeBps: fred2y.status === "fulfilled" ? round((fred2y.value.latest.value - fred2y.value.previous.value) * 100, 1) : null,
+      us10yDailyChangeBps: fred10y.status === "fulfilled" ? round((fred10y.value.latest.value - fred10y.value.previous.value) * 100, 1) : null,
     };
-  }
-
-  private async fetchYahooRef(refKey: "DXY" | "VIX"): Promise<{ value: number; changePct: number }> {
-    return withConnectorHealth(`marketData:${refKey}`, async () => {
-      const chart = await fetchYahooChart(YAHOO_SYMBOL[refKey]);
-      const changePct = chart.previousClose ? ((chart.last - chart.previousClose) / chart.previousClose) * 100 : 0;
-      return { data: { value: round(chart.last, 2), changePct: round(changePct, 2) } };
-    });
-  }
-
-  private async fetchFredRef(refKey: "US2Y" | "US10Y", seriesId: string): Promise<{ value: number; changeBps: number }> {
-    return withConnectorHealth(`marketData:${refKey}`, async () => {
-      const { latest, previous } = await fetchFredSeries(seriesId);
-      const changeBps = (latest.value - previous.value) * 100;
-      const ageHours = (Date.now() - new Date(latest.date).getTime()) / 3_600_000;
-      const value = { value: round(latest.value, 3), changeBps: round(changeBps, 1) };
-      if (ageHours > 96) {
-        // Yields are daily-resolution; > ~4 days stale means the series hasn't updated (e.g. long weekend) — still real, just old.
-        return { data: value, partial: `Latest FRED ${seriesId} observation is from ${latest.date} (${Math.round(ageHours)}h old)` };
-      }
-      return { data: value };
-    });
-  }
-}
-
-class SampleMarketDataConnector implements MarketDataConnector {
-  async getSnapshot(symbol: string): Promise<MarketSnapshot> {
-    return sampleSnapshot(symbol);
-  }
-
-  async getMacroSnapshot(): Promise<MacroSnapshot> {
-    return sampleMacroSnapshot();
-  }
-}
-
-/** Always attempts live data first (Yahoo Finance + FRED, both keyless) and
- * only falls back to the sample generator per-field on failure — see
- * connectorHealth for how "live" vs "blocked" vs "partial" is tracked and
- * surfaced on the Live Data Status page. Set MARKET_DATA_BASE_URL +
- * MARKET_DATA_API_KEY to use a premium vendor instead. */
-class SmartMarketDataConnector implements MarketDataConnector {
-  private live = new LiveMarketDataConnector();
-  private sample = new SampleMarketDataConnector();
-
-  async getSnapshot(symbol: string): Promise<MarketSnapshot> {
-    try {
-      return await this.live.getSnapshot(symbol);
-    } catch {
-      return this.sample.getSnapshot(symbol);
-    }
-  }
-
-  async getMacroSnapshot(): Promise<MacroSnapshot> {
-    // getMacroSnapshot never throws — each sub-series falls back independently.
-    return this.live.getMacroSnapshot();
-  }
-}
-
-class PremiumVendorConnector implements MarketDataConnector {
-  constructor(private readonly baseUrl: string, private readonly apiKey: string) {}
-
-  async getSnapshot(symbol: string): Promise<MarketSnapshot> {
-    return withConnectorHealth(`marketData:${symbol}`, async () => {
-      const res = await fetch(`${this.baseUrl}/bars?symbol=${encodeURIComponent(symbol)}`, {
-        headers: { Authorization: `Bearer ${this.apiKey}`, accept: "application/json" },
-      });
-      if (!res.ok) throw new Error(`Market data error ${res.status}: ${await res.text()}`);
-      const data = (await res.json()) as MarketSnapshot;
-      return { data };
-    });
-  }
-
-  async getMacroSnapshot(): Promise<MacroSnapshot> {
-    return withConnectorHealth("marketData:macro", async () => {
-      const res = await fetch(`${this.baseUrl}/macro`, {
-        headers: { Authorization: `Bearer ${this.apiKey}`, accept: "application/json" },
-      });
-      if (!res.ok) throw new Error(`Macro feed error ${res.status}: ${await res.text()}`);
-      const data = (await res.json()) as MacroSnapshot;
-      return { data };
-    });
   }
 }
 
 export function getMarketDataConnector(): { connector: MarketDataConnector; mode: "live" } {
-  const baseUrl = process.env.MARKET_DATA_BASE_URL;
-  const apiKey = process.env.MARKET_DATA_API_KEY;
-  if (baseUrl && apiKey) return { connector: new PremiumVendorConnector(baseUrl, apiKey), mode: "live" };
   return { connector: new SmartMarketDataConnector(), mode: "live" };
 }

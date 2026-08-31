@@ -1,33 +1,81 @@
 # Ingestion connectors
 
-Every connector in this folder implements an interface from `types.ts`. Each
-file ships a **sample/dev provider** that returns realistic, deterministically
-seeded data — so the surprise engine, scoring, and dashboards are fully
-exercisable with `npm run dev` and no credentials at all.
+Every connector attempts real live data by default — no API key required for
+the Forex Factory Calendar, Forex Factory News, or market data (Yahoo
+Finance / FRED). A connector only serves sample data as a fallback when a
+live fetch genuinely fails, and only in `APP_MODE=development` — in
+production a failure raises `DataUnavailableError` instead (see
+`../config/appMode.ts`). Every real attempt, live or failed, is recorded in
+the `connector_health` table and shown on the **Live Data Status** dashboard
+tab, so "connected" is never confused with "actually live right now."
 
-Forex Factory has no public REST API, so wiring a real feed means one of:
+## Calendar — `forexFactoryCalendar.ts`
 
-1. A licensed/structured calendar mirror (several vendors resell FF's
-   calendar data in JSON/CSV) — point `FOREX_FACTORY_CALENDAR_URL` at it and
-   implement `parseCalendarPayload()` in `forexFactoryCalendar.ts` for its
-   schema.
-2. Your own scraper/automation service that normalizes forexfactory.com into
-   the `EconomicEvent` shape and exposes it over HTTP — same env var.
-3. For breaking news: forexfactory.com's own news stream/RSS-like feed, via
-   `FOREX_FACTORY_NEWS_URL`.
-4. For email alerts: point Forex Factory's "email me when..." alerts at an
-   inbox whose provider supports inbound-parse webhooks (Mailgun, SendGrid,
-   Postmark). Configure that webhook to POST to `/api/ingest/email` with
-   `INBOUND_EMAIL_WEBHOOK_SECRET` as a bearer/shared-secret header. That route
-   calls `emailToHeadline()` (see `types.ts`) and feeds the result straight
-   into the same news-analysis pipeline breaking news uses — so an email
-   alert triggers analysis immediately, per spec.
+**This is the Forex Factory Calendar.** `ff_calendar_thisweek.json` is Forex
+Factory's own Weekly Export mechanism (JSON/CSV/XML/ICS), served from
+`nfs.faireconomy.media` — not a third-party mirror or approximation. Set
+`FOREX_FACTORY_CALENDAR_URL` to point at a different export (e.g. a licensed
+Flex Account feed) instead.
 
-Market data (`marketData.ts`) is provider-agnostic by design — set
-`MARKET_DATA_BASE_URL`/`MARKET_DATA_API_KEY` to any OHLCV/quote REST API
-(a broker's API, Polygon, Twelve Data, etc.) and implement `fetchLive()`.
+## Breaking news — `forexFactoryNews.ts` + `forexFactoryNewsDirect.ts`
 
-None of this ships "faked as real" — every connector logs which mode
-(`live` vs `sample`) it is running in, and that mode is surfaced in the
-dashboard's system status so it's never ambiguous whether a signal was
-generated from live inputs or demo fixtures.
+**PRIMARY: Forex Factory News.** Forex Factory has no public news API, so
+`forexFactoryNewsDirect.ts` scrapes `forexfactory.com/news` directly —
+genuine HTML scraping, which is inherently more fragile than the calendar's
+JSON export (FF's markup isn't a documented/versioned contract, and can
+change). A parse that finds zero items is treated as a failure, never
+silently returned as "nothing happened" — see that file's doc comments for
+the selector strategy and its documented limits.
+
+**SECONDARY: ForexLive.** A real, keyless, forex/macro-focused RSS wire,
+fetched *concurrently* with the primary source (not just as a failure
+fallback) so a story either wire reports first still reaches the pipeline
+quickly. Always labeled "ForexLive (secondary)" — never relabeled as Forex
+Factory. It is intentionally **not** counted in the Day engine's required
+data-quality sources (`dataQuality/dataQualityEngine.ts`), so its health
+never gates a trade the way the primary source's does.
+
+Both streams feed the same `news/clustering.ts` — the same story reported by
+both Forex Factory and ForexLive clusters into one `story_id`, not two.
+
+Set `FOREX_FACTORY_NEWS_URL` to a licensed Forex Factory feed (JSON) to
+replace the scraper with something more durable, while keeping ForexLive as
+secondary.
+
+## Email alerts — `../gmail/client.ts` + `/api/ingest/email`
+
+Two paths, either or both can be active:
+
+1. **Gmail OAuth** (primary path) — connect the Gmail account that receives
+   Forex Factory's "email me when..." alerts; every cron tick polls for new
+   ones and feeds them straight into the news pipeline. See
+   `../pipeline/gmailPipeline.ts`.
+2. **Inbound-parse webhook** — point your email provider's inbound-parse
+   webhook (Mailgun, SendGrid, Postmark) at `POST /api/ingest/email` with
+   `INBOUND_EMAIL_WEBHOOK_SECRET`. Calls `emailToHeadline()` (`types.ts`) and
+   feeds the pipeline immediately on receipt — no polling delay.
+
+## Market data — `../marketdata/*` + `marketData.ts`
+
+Provider-agnostic by design (spec requirement: swap providers without
+rewriting the scoring engines). `marketData.ts` is a thin adapter over
+`../marketdata/registry.ts`'s provider selection:
+
+- **Yahoo Finance** (`providers/yahoo.ts`) — default, keyless, but an
+  unofficial/undocumented public endpoint (not a contracted real-time feed;
+  `getHealth()` reports `realtime: false` honestly).
+- **Twelve Data** (`providers/twelvedata.ts`) — real paid low-latency REST +
+  WebSocket integration, set `MARKET_DATA_PROVIDER=twelvedata` +
+  `TWELVE_DATA_API_KEY`. Streaming only works from a persistent process, not
+  a serverless API route — see that file's doc comment and
+  `scripts/streaming-worker.ts`.
+- **CME** (`providers/cme.ts`) — documented, deliberately non-functional stub
+  (requires a licensed CME Market Data Platform agreement this build doesn't
+  have). Exists to complete the interface, not as working code.
+
+Treasury 2Y/10Y: the Day engine's intraday cross-market confirmation uses
+**ZT/ZN Treasury futures** (via whichever provider is active) normalized into
+a signed hawkish/dovish "rate pressure" score (`../marketdata/ratePressure.ts`)
+— never FRED, which is daily-resolution and cannot support intraday
+confirmation. FRED (`fetchFredSeries` in `marketData.ts`) is kept as
+daily-only macro context for the Swing engine and dashboard display.

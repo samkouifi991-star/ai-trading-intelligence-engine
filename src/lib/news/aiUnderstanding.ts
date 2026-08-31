@@ -19,6 +19,10 @@ affectedCurrencies (string[], ISO-style 3-letter codes)
 affectedCommodities (string[])
 affectedIndices (string[])
 eventType (string, short category e.g. "geopolitical", "central_bank", "economic_data", "supply_shock")
+sourceAttribution (string or null — WHO said it, e.g. "Fed Chair Powell", "ECB's Lagarde", "Reuters
+ sourcing"; null if this is a data release or the source isn't a quoted individual/institution)
+confirmed (boolean — does this read as confirmed fact (an official statement, a released data
+ print) rather than an unconfirmed/rumored/sourced-but-unofficial report?)
 severity (integer 0-100, how large a market-moving event this is)
 confidence (integer 0-100, your confidence in this read)
 expectedDurationMinutes (integer, how long this catalyst should realistically matter for a DAY trading horizon)
@@ -63,6 +67,8 @@ export async function analyzeStory(params: {
     affectedCommodities: base.affectedCommodities,
     affectedIndices: base.affectedIndices,
     eventType: base.eventType,
+    sourceAttribution: base.sourceAttribution,
+    confirmed: base.confirmed,
     severity: base.severity,
     confidence: base.confidence,
     expectedDurationMinutes: base.expectedDurationMinutes,
@@ -133,6 +139,8 @@ function analyzeWithHeuristicFallback(headlines: RawHeadline[]): LlmShape {
     affectedCommodities: oil ? ["WTI"] : [],
     affectedIndices: riskOff ? ["ES", "NQ"] : [],
     eventType: riskOff ? "geopolitical" : hawkish || dovish ? "central_bank" : "general",
+    sourceAttribution: null, // the heuristic can't reliably extract "who said it" from keyword matching
+    confirmed: true, // headlines from a verified_news wire are treated as reported fact by default; this heuristic can't judge rumor-vs-confirmed nuance the way the LLM can
     severity: riskOff ? 60 : 35,
     confidence: 40, // deliberately capped low — this is a heuristic, not real understanding
     expectedDurationMinutes: riskOff ? 90 : 45,

@@ -2,16 +2,16 @@ import { TRADABLE_UNIVERSE } from "../universe";
 import { getRecentStories, getEventsInRange, saveSignal } from "../db/repository";
 import { decayedSeverity, currentDecayFactor } from "../news/decay";
 import { scoreEconomicSurprise, aggregateSurpriseScore } from "../economicSurprise/surpriseEngine";
-import { getCurrentRegime } from "./regimePipeline";
 import { relevantCurrenciesForInstrument } from "./economicPipeline";
 import { getMarketDataConnector } from "../ingestion/marketData";
 import { buildTechnicalReadout } from "../technical/indicators";
 import { checkCrossAssetConfirmation } from "../crossAsset/confirmationEngine";
 import { computeDayTradeScore } from "../scoring/dayTradeScore";
-import { marketRegimeScore as regimeScoreOf } from "../regime/regimeEngine";
+import { computeMacroRegime, marketRegimeScore as regimeScoreOf } from "../regime/regimeEngine";
 import { buildSignal } from "../signals/signalBuilder";
 import { rankOpportunities } from "../scoring/rank";
-import type { Direction, NewsStory, TradeSignal } from "../types";
+import { computeDataQualityScore, dayRequiredSources } from "../dataQuality/dataQualityEngine";
+import type { Direction, MacroRegime, MacroSnapshot, NewsStory, TradeSignal } from "../types";
 
 const MIN_DECAYED_SEVERITY_TO_CONSIDER = 8;
 const MIN_ABS_IMPACT_TO_CONSIDER = 12;
@@ -25,8 +25,30 @@ export interface DayEngineResult {
 }
 
 export async function runDayEngine(now: Date = new Date()): Promise<DayEngineResult> {
-  const { regime } = await getCurrentRegime();
   const { connector: marketData } = getMarketDataConnector();
+
+  // Fetched ONCE for the whole tick, not per-instrument — every instrument's
+  // cross-market confirmation compares against the same macro snapshot, and
+  // if it's unavailable (production mode with a required source blocked),
+  // that's a "can't safely evaluate anything this tick" condition, not a
+  // per-instrument one.
+  let macro: MacroSnapshot;
+  let regime: MacroRegime;
+  try {
+    macro = await marketData.getMacroSnapshot();
+    regime = computeMacroRegime(macro);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return {
+      regimeSummary: `Regime unavailable: ${reason}`,
+      candidates: [],
+      ranked: [],
+      suppressed: [],
+      noTradeReasons: TRADABLE_UNIVERSE.map(
+        (i) => `${i.symbol}: required cross-market confirmation data unavailable (${reason}).`
+      ),
+    };
+  }
 
   const allStories = getRecentStories(60);
   const dayStories = allStories.filter(
@@ -66,12 +88,11 @@ export async function runDayEngine(now: Date = new Date()): Promise<DayEngineRes
     let snapshot;
     try {
       snapshot = await marketData.getSnapshot(instrument.symbol);
-    } catch {
-      noTradeReasons.push(`${instrument.symbol}: market data unavailable.`);
+    } catch (err) {
+      noTradeReasons.push(`${instrument.symbol}: market data unavailable (${err instanceof Error ? err.message : String(err)}).`);
       continue;
     }
     const technical = buildTechnicalReadout(snapshot);
-    const macro = await marketData.getMacroSnapshot();
     const crossAssetCheck = checkCrossAssetConfirmation({
       symbol: instrument.symbol,
       predictedDirection: direction,
@@ -91,6 +112,8 @@ export async function runDayEngine(now: Date = new Date()): Promise<DayEngineRes
       .filter((e) => relevantCurrencies.includes(e.currency))
       .map((e) => `${e.event} (${e.currency}, ${e.impact} impact) at ${e.eventTimeUtc}`);
 
+    const dataQuality = computeDataQualityScore(dayRequiredSources(instrument.symbol));
+
     const signal = buildSignal({
       engine: "DAY",
       instrument: instrument.symbol,
@@ -103,6 +126,8 @@ export async function runDayEngine(now: Date = new Date()): Promise<DayEngineRes
       crossAssetCheck,
       story,
       upcomingRisks,
+      newsImpactScore: impactScore,
+      dataQualityScore: dataQuality.score,
       now,
     });
 

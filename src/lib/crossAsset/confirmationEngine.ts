@@ -1,7 +1,26 @@
 import type { CrossAssetCheck, Direction, MacroSnapshot, TechnicalReadout } from "../types";
-import { getInstrument } from "../universe";
+import { getInstrument, type InstrumentMeta } from "../universe";
 
 const YIELD_SENSITIVE_ASSET_CLASSES = new Set(["metal"]);
+
+/**
+ * Signed -100..100 read of what the market is actually doing for this
+ * instrument right now, computed independently of any prediction: real
+ * measured momentum (70% weight) blended with the DXY reaction translated
+ * into this instrument's own directional frame (30% weight, USD-sensitive
+ * instruments only). This is the "MARKET CONFIRMATION" score — deliberately
+ * never derived from predictedDirection, so it can genuinely agree or
+ * disagree with the news-impact prediction rather than echoing it.
+ */
+function computeConfirmationDirectionScore(instrument: InstrumentMeta | undefined, macro: MacroSnapshot, technical: TechnicalReadout): number {
+  let score = technical.momentum;
+  if (instrument && instrument.usdSensitivity !== "mixed") {
+    const dxySignedForInstrument = instrument.usdSensitivity === "negative" ? -macro.dxyChangePct : macro.dxyChangePct;
+    const dxyComponent = Math.max(-100, Math.min(100, dxySignedForInstrument * 40));
+    score = score * 0.7 + dxyComponent * 0.3;
+  }
+  return Math.max(-100, Math.min(100, Math.round(score)));
+}
 
 /**
  * Never trades purely on the AI's predicted direction. Compares the
@@ -42,17 +61,19 @@ export function checkCrossAssetConfirmation(params: {
     }
   }
 
-  // Factor 2: US real-yield proxy (2Y/10Y) — most relevant for gold, but
-  // included at lower weight for everything as a general risk-appetite tell.
-  const yieldsRising = macro.us2yChangeBps > 1 && macro.us10yChangeBps > 1;
-  const yieldsFalling = macro.us2yChangeBps < -1 && macro.us10yChangeBps < -1;
+  // Factor 2: real-time rate pressure (2Y/10Y Treasury-futures-derived, NOT
+  // FRED's daily yields — see MacroSnapshot's doc comment) — most relevant
+  // for gold, but included at lower weight for everything as a general
+  // risk-appetite tell.
+  const yieldsRising = macro.us2yRatePressure > 15 && macro.us10yRatePressure > 15;
+  const yieldsFalling = macro.us2yRatePressure < -15 && macro.us10yRatePressure < -15;
   if ((yieldsRising || yieldsFalling) && (instrument ? YIELD_SENSITIVE_ASSET_CLASSES.has(instrument.assetClass) : true)) {
     const instrumentShouldFall = yieldsRising; // higher yields -> higher opportunity cost of holding gold/non-yielding assets
     const supports = wantsUp ? !instrumentShouldFall : instrumentShouldFall;
     factors.push({
-      name: "US yields",
+      name: "Rate pressure (2Y/10Y)",
       supportsDirection: supports,
-      detail: `US2Y ${macro.us2yChangeBps >= 0 ? "+" : ""}${macro.us2yChangeBps.toFixed(1)}bp / US10Y ${macro.us10yChangeBps >= 0 ? "+" : ""}${macro.us10yChangeBps.toFixed(1)}bp ${supports ? "supports" : "contradicts"} ${predictedDirection}.`,
+      detail: `2Y rate pressure ${macro.us2yRatePressure >= 0 ? "+" : ""}${macro.us2yRatePressure} / 10Y rate pressure ${macro.us10yRatePressure >= 0 ? "+" : ""}${macro.us10yRatePressure} ${supports ? "supports" : "contradicts"} ${predictedDirection}.`,
     });
   }
 
@@ -85,8 +106,10 @@ export function checkCrossAssetConfirmation(params: {
     // reserved for a genuine break which technical.ts flags via momentum extremes.
   }
 
+  const confirmationDirectionScore = computeConfirmationDirectionScore(instrument, macro, technical);
+
   if (factors.length === 0) {
-    return { symbol, predictedDirection, confirmationScore: 50, aligned: false, contradicted: false, factors };
+    return { symbol, predictedDirection, confirmationScore: 50, confirmationDirectionScore, aligned: false, contradicted: false, factors };
   }
 
   const supportingCount = factors.filter((f) => f.supportsDirection).length;
@@ -96,6 +119,7 @@ export function checkCrossAssetConfirmation(params: {
     symbol,
     predictedDirection,
     confirmationScore,
+    confirmationDirectionScore,
     aligned: confirmationScore >= 60,
     contradicted: confirmationScore <= 35,
     factors,

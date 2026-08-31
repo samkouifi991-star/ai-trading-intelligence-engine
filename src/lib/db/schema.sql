@@ -95,7 +95,11 @@ CREATE TABLE IF NOT EXISTS connector_health (
   status TEXT NOT NULL, -- 'live' | 'partial' | 'sample' | 'blocked'
   detail TEXT NOT NULL,
   last_attempt_utc TEXT NOT NULL,
-  last_success_utc TEXT
+  last_success_utc TEXT,
+  latency_ms INTEGER,       -- round-trip time of the most recent attempt
+  realtime INTEGER,         -- 0/1 — does this source claim true real-time data (vs delayed)?
+  streaming_mode TEXT,      -- 'streaming' | 'polling'
+  market_open INTEGER       -- 0/1 — is the relevant market open right now (instrument sources only)?
 );
 
 -- OAuth tokens for the Gmail Forex Factory alert ingestion. Single-row table
@@ -120,3 +124,19 @@ CREATE TABLE IF NOT EXISTS premarket_snapshots (
   payload_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_premarket_day ON premarket_snapshots(trading_day DESC);
+
+-- Event Clock: one row per (story, checkpoint, market) snapshot. Captured
+-- opportunistically at whatever cadence the pipeline actually ticks — see
+-- src/lib/pipeline/eventClock.ts for why sub-minute checkpoints (T+15s/
+-- T+30s) need a faster-than-serverless-cron poller for true fidelity.
+CREATE TABLE IF NOT EXISTS event_clock (
+  id TEXT PRIMARY KEY,
+  story_id TEXT NOT NULL REFERENCES news_stories(story_id),
+  t0_utc TEXT NOT NULL,
+  checkpoint TEXT NOT NULL,  -- 'T-5m' | 'T-1m' | 'T0' | 'T+15s' | ... | 'T+60m'
+  symbol TEXT NOT NULL,
+  price REAL NOT NULL,
+  captured_at_utc TEXT NOT NULL, -- actual capture time (may lag the checkpoint's target time)
+  UNIQUE(story_id, checkpoint, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_event_clock_story ON event_clock(story_id);

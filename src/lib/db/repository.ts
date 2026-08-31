@@ -148,6 +148,7 @@ function rowToStory(row: any): NewsStory {
       source: h.source,
       sourceQuality: h.source_quality,
       url: h.url ?? undefined,
+      contentType: "verified_news" as const,
     })),
   };
 }
@@ -387,4 +388,51 @@ export function getAllOpenLearningRecordsForReaction(maxAgeHours = 30): {
     maxFavorableExcursion: r.max_favorable_excursion,
     maxAdverseExcursion: r.max_adverse_excursion,
   }));
+}
+
+// ── Event Clock ─────────────────────────────────────────────────────────
+
+export function saveEventClockSnapshot(params: {
+  storyId: string;
+  t0Utc: string;
+  checkpoint: string;
+  symbol: string;
+  price: number;
+}): void {
+  const db = getDb();
+  db.prepare(
+    `INSERT OR IGNORE INTO event_clock (id, story_id, t0_utc, checkpoint, symbol, price, captured_at_utc)
+     VALUES (@id, @storyId, @t0Utc, @checkpoint, @symbol, @price, @capturedAtUtc)`
+  ).run({
+    id: `${params.storyId}:${params.checkpoint}:${params.symbol}`,
+    storyId: params.storyId,
+    t0Utc: params.t0Utc,
+    checkpoint: params.checkpoint,
+    symbol: params.symbol,
+    price: params.price,
+    capturedAtUtc: new Date().toISOString(),
+  });
+}
+
+export interface EventClockRow {
+  checkpoint: string;
+  symbol: string;
+  price: number;
+  capturedAtUtc: string;
+}
+
+export function getEventClockForStory(storyId: string): EventClockRow[] {
+  const db = getDb();
+  const rows = db
+    .prepare(`SELECT checkpoint, symbol, price, captured_at_utc FROM event_clock WHERE story_id = ? ORDER BY captured_at_utc ASC`)
+    .all(storyId) as any[];
+  return rows.map((r) => ({ checkpoint: r.checkpoint, symbol: r.symbol, price: r.price, capturedAtUtc: r.captured_at_utc }));
+}
+
+/** Set of "checkpoint:symbol" keys already captured for this story, so the
+ * capture loop can skip live fetches it doesn't need to repeat. */
+export function getCapturedCheckpointSymbols(storyId: string): Set<string> {
+  const db = getDb();
+  const rows = db.prepare(`SELECT checkpoint, symbol FROM event_clock WHERE story_id = ?`).all(storyId) as { checkpoint: string; symbol: string }[];
+  return new Set(rows.map((r) => `${r.checkpoint}:${r.symbol}`));
 }

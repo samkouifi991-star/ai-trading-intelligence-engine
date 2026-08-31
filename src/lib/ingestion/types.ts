@@ -36,5 +36,6 @@ export function emailToHeadline(input: {
     body: input.bodyText,
     source: "Forex Factory Email Alert",
     sourceQuality: 90,
+    contentType: "verified_news",
   };
 }

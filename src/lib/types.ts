@@ -53,6 +53,16 @@ export interface StructuredNewsAnalysis {
   affectedIndices: string[];
   eventType: string;
   novelty: NoveltyLevel;
+  /** Who said it, when identifiable (e.g. "Fed Chair Powell", "ECB's
+   * Lagarde", "Reuters sourcing"). Null when the story is a data release or
+   * the source isn't a quoted individual/institution. */
+  sourceAttribution: string | null;
+  /** Whether this reads as confirmed fact (an official statement, a
+   * released data print) vs. unconfirmed/rumored/sourced-but-unofficial.
+   * Distinct from `novelty` (which is deterministic, from clustering) —
+   * this is the LLM's read of the story's own certainty, still only ever
+   * used as an input to deterministic scoring, never a trade decision. */
+  confirmed: boolean;
   severity: number; // 0..100
   confidence: number; // 0..100
   expectedDurationMinutes: number;
@@ -72,6 +82,38 @@ export interface RawHeadline {
   source: string;
   sourceQuality: number;
   url?: string;
+  /** Forex Factory's own High/Medium/Low breaking-news impact rating, when
+   * the headline came from Forex Factory. Used as ONE input into the news
+   * score, never copied directly into the trade score (spec rule 2). */
+  ffImpact?: "high" | "medium" | "low" | "unknown";
+  relatedCurrency?: string | null;
+  /** Every RawHeadline that reaches the pipeline is, by construction,
+   * verified_news (a real breaking-news wire or calendar release) —
+   * community_sentiment (e.g. Forex Factory forum/comment content) is a
+   * deliberately separate, NOT-YET-IMPLEMENTED concept (see
+   * CommunitySentimentSignal below) that must never be constructed as a
+   * RawHeadline or enter this pipeline (spec rule 10). This field exists so
+   * that guarantee is visible in the type, not just a comment. */
+  contentType: "verified_news";
+}
+
+/**
+ * Deliberately unused placeholder documenting spec rule 10: Forex Factory
+ * comments/forum content may eventually be analyzed as crowd sentiment, but
+ * must NEVER be treated as fact or enter the news/fundamental scoring
+ * pipeline. Nothing in this codebase currently populates this type — it
+ * exists so that if/when community-sentiment ingestion is built, its output
+ * type is structurally incompatible with RawHeadline/StructuredNewsAnalysis
+ * and cannot be passed into analyzeStory, clusterHeadline, or any scoring
+ * function by accident.
+ */
+export interface CommunitySentimentSignal {
+  id: string;
+  timestampUtc: string;
+  commentText: string;
+  authorHandle: string | null;
+  sourceThreadUrl: string;
+  contentType: "community_sentiment"; // never "verified_news" — not type-compatible with RawHeadline
 }
 
 export interface NewsStory {
@@ -108,13 +150,30 @@ export interface MarketSnapshot {
 export interface MacroSnapshot {
   timeUtc: string;
   dxy: number;
-  us2y: number;
-  us10y: number;
-  vix: number;
   dxyChangePct: number;
-  us2yChangeBps: number;
-  us10yChangeBps: number;
+  vix: number;
   vixChangePct: number;
+
+  /** Real-time proxy for 2Y/10Y rate expectations, derived from ZT=F/ZN=F
+   * Treasury futures intraday price moves (inverse relationship normalized
+   * into a signed hawkish(+)/dovish(-) pressure score, -100..100). THIS is
+   * what the Day engine's cross-asset confirmation uses — see
+   * src/lib/marketdata/ratePressure.ts. Never sourced from FRED, which is
+   * daily-resolution and cannot support intraday confirmation. */
+  us2yRatePressure: number;
+  us10yRatePressure: number;
+
+  /** Daily-resolution official Treasury yield levels/trend from FRED
+   * (DGS2/DGS10) — real government data, but settles once/day. Useful for
+   * swing-engine macro context and the dashboard's daily trend display;
+   * NEVER used for Day-engine intraday cross-asset confirmation. Null if
+   * the FRED fetch hasn't succeeded (production mode with FRED blocked, for
+   * example) — callers must treat null as "no daily context available",
+   * not fall back to a stale/fake number. */
+  us2yDaily: number | null;
+  us10yDaily: number | null;
+  us2yDailyChangeBps: number | null;
+  us10yDailyChangeBps: number | null;
 }
 
 // ── Regime ────────────────────────────────────────────────────────────────
@@ -139,7 +198,13 @@ export interface MacroRegime {
 export interface CrossAssetCheck {
   symbol: string;
   predictedDirection: Direction;
-  confirmationScore: number; // 0-100
+  confirmationScore: number; // 0-100, unsigned "how many factors agree with predictedDirection"
+  /** Signed -100..100 read of what the market is ACTUALLY doing right now
+   * (momentum + DXY reaction), computed independently of predictedDirection
+   * — this is the "MARKET CONFIRMATION" half of spec rule 8's prediction-
+   * vs-confirmation split, comparable in sign/scale to a story's signed
+   * news-impact score for the same instrument. */
+  confirmationDirectionScore: number;
   aligned: boolean;
   contradicted: boolean;
   factors: { name: string; supportsDirection: boolean; detail: string }[];
@@ -189,14 +254,35 @@ export interface TradeSignal {
   engine: Engine;
   instrument: string;
   direction: Direction;
+  /** Final confidence AFTER the data-quality gate's confidence penalty (see
+   * signals/validation.ts) — never the raw composite score when data
+   * quality is degraded. */
   confidence: number; // 0-100
   catalyst: string;
   newsSummary: string;
+
+  /** Prediction vs confirmation, kept explicitly separate per spec rule 8 —
+   * never blended invisibly into one number. newsImpactScore is the AI news
+   * understanding engine's signed asset-impact read (what we expected to
+   * happen); marketConfirmationScore is the cross-asset engine's signed
+   * read of what the market is actually doing right now, independent of
+   * the prediction. `direction` is the final reconciled call. */
+  newsImpactScore: number | null; // -100..100
+  marketConfirmationScore: number | null; // -100..100
+
   economicSurpriseScore: number | null;
   fundamentalScore: number | null;
   technicalScore: number | null;
   crossMarketConfirmationScore: number | null;
   marketRegimeScore: number | null;
+
+  /** Weighted quality of the data this signal was built from (spec rule 6) —
+   * see src/lib/dataQuality/dataQualityEngine.ts. A high composite score
+   * built on low-quality data is penalized or gated by validation.ts, and
+   * that gate's reasoning is preserved here for display. */
+  dataQualityScore: number;
+  dataQualityReason: string | null;
+
   entryZone: [number, number] | null;
   invalidation: number | null;
   target1: number | null;

@@ -1,7 +1,7 @@
 import type { EconomicEvent } from "../types";
 import type { CalendarConnector } from "./types";
 import { hashString, mulberry32 } from "./seededRandom";
-import { withConnectorHealth } from "./connectorHealth";
+import { withConnectorHealth, resolveLiveOrFallback } from "./connectorHealth";
 
 const SOURCE_KEY = "calendar";
 
@@ -112,15 +112,16 @@ class SampleCalendarConnector implements CalendarConnector {
 // ── Live connector ──────────────────────────────────────────────────────
 
 /**
- * Forex Factory itself has no public REST API. `ff_calendar_thisweek.json`
- * (served from faireconomy.media, the vendor Forex Factory's calendar widget
- * partners have used for years) is a real, public, keyless mirror of FF's
- * own calendar data — this is genuine FF calendar data, not a fabrication,
- * just not fetched from forexfactory.com's own domain directly. Rows look
- * like: {"title":"Non-Farm Payrolls","country":"USD","date":"2026-09-
- * 05T12:30:00-04:00","impact":"High","forecast":"180K","previous":"175K",
- * "actual":"187K"}. Set FOREX_FACTORY_CALENDAR_URL to point at a different
- * (e.g. licensed/paid) feed instead — see src/lib/ingestion/README.md.
+ * This IS the Forex Factory Calendar — `ff_calendar_thisweek.json` is Forex
+ * Factory's own Weekly Export (JSON/CSV/XML/ICS), served from
+ * nfs.faireconomy.media, which Forex Factory itself uses for this export
+ * mechanism. It is not a third-party mirror or approximation; every field
+ * (event, currency, impact, forecast, previous, actual) is FF's own data.
+ * Rows look like: {"title":"Non-Farm Payrolls","country":"USD","date":
+ * "2026-09-05T12:30:00-04:00","impact":"High","forecast":"180K",
+ * "previous":"175K","actual":"187K"}. Set FOREX_FACTORY_CALENDAR_URL to
+ * point at a different (e.g. a licensed Flex Account) export instead — see
+ * src/lib/ingestion/README.md.
  */
 const DEFAULT_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
 
@@ -157,12 +158,12 @@ function mapImpact(raw: string): "high" | "medium" | "low" {
   return "low";
 }
 
-/** Maps one faireconomy.media calendar row into our EconomicEvent shape.
- * Exported for unit testing against a realistic fixture (see
- * scripts/run-tests.ts) — this parser cannot be exercised against the real
- * live endpoint from inside a network-restricted environment, so its
- * correctness is verified against a hand-built fixture matching the feed's
- * documented/observed schema instead. */
+/** Maps one Forex Factory Calendar (Weekly Export) row into our
+ * EconomicEvent shape. Exported for unit testing against a realistic
+ * fixture (see scripts/run-tests.ts) — this parser cannot be exercised
+ * against the real live endpoint from inside a network-restricted
+ * environment, so its correctness is verified against a hand-built fixture
+ * matching the feed's documented/observed schema instead. */
 export function mapFairEconomyRow(row: any): EconomicEvent | null {
   const title = row.title ?? row.event;
   const country = row.country ?? row.currency;
@@ -182,7 +183,7 @@ export function mapFairEconomyRow(row: any): EconomicEvent | null {
     forecast: parseFeedNumber(row.forecast),
     previous: parseFeedNumber(row.previous),
     revisedPrevious: null, // this feed does not carry a separate revised-previous field
-    source: "forexfactory-calendar-live",
+    source: "Forex Factory Calendar",
     description: `${title} (${country})`,
   };
 }
@@ -243,19 +244,19 @@ class SmartCalendarConnector implements CalendarConnector {
   }
 
   async fetchUpcoming(hoursAhead = 48): Promise<EconomicEvent[]> {
-    try {
-      return await this.live.fetchUpcoming(hoursAhead);
-    } catch {
-      return this.sample.fetchUpcoming(hoursAhead);
-    }
+    return resolveLiveOrFallback(
+      "calendar",
+      () => this.live.fetchUpcoming(hoursAhead),
+      () => this.sample.fetchUpcoming(hoursAhead)
+    );
   }
 
   async fetchRecent(hoursBack = 24): Promise<EconomicEvent[]> {
-    try {
-      return await this.live.fetchRecent(hoursBack);
-    } catch {
-      return this.sample.fetchRecent(hoursBack);
-    }
+    return resolveLiveOrFallback(
+      "calendar",
+      () => this.live.fetchRecent(hoursBack),
+      () => this.sample.fetchRecent(hoursBack)
+    );
   }
 }
 

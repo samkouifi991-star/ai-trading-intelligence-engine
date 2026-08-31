@@ -25,6 +25,22 @@ export default function SignalDetail({ signal }: { signal: TradeSignal }) {
       <p className="mt-2 text-sm text-gray-300">{signal.catalyst}</p>
       <p className="mt-1 text-xs text-gray-500">{signal.newsSummary}</p>
 
+      {/* Prediction vs. confirmation, shown separately — never blended (spec rule 8) */}
+      <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
+        <SignedMetric label="News Impact" value={signal.newsImpactScore} />
+        <SignedMetric label="Market Confirmation" value={signal.marketConfirmationScore} />
+        <div className="rounded border border-accent/40 bg-accent/10 px-2 py-1.5">
+          <div className="text-[10px] uppercase text-gray-400">Final Direction</div>
+          <div className="font-mono text-sm font-bold">{signal.direction}</div>
+        </div>
+      </div>
+
+      <div className="mt-2 flex items-center gap-2 text-xs">
+        <span className="text-gray-500">Data Quality:</span>
+        <span className={`font-mono font-bold ${dataQualityColor(signal.dataQualityScore)}`}>{signal.dataQualityScore}/100</span>
+        {signal.dataQualityReason && <span className="text-gray-500">— {signal.dataQualityReason}</span>}
+      </div>
+
       <div className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
         <Metric label="Entry" value={signal.entryZone ? `${fmt(signal.entryZone[0])} – ${fmt(signal.entryZone[1])}` : "—"} />
         <Metric label="Invalidation" value={fmt(signal.invalidation)} />
@@ -95,4 +111,23 @@ function Metric({ label, value }: { label: string; value: string }) {
       <div className="font-mono text-sm">{value}</div>
     </div>
   );
+}
+
+function SignedMetric({ label, value }: { label: string; value: number | null }) {
+  const color = value === null ? "text-gray-500" : value > 0 ? "text-long" : value < 0 ? "text-short" : "text-gray-400";
+  return (
+    <div className="rounded border border-border bg-panel px-2 py-1.5">
+      <div className="text-[10px] uppercase text-gray-500">{label}</div>
+      <div className={`font-mono text-sm font-bold ${color}`}>
+        {value === null ? "—" : `${value > 0 ? "+" : ""}${value}`}
+      </div>
+    </div>
+  );
+}
+
+function dataQualityColor(score: number): string {
+  if (score >= 90) return "text-long";
+  if (score >= 75) return "text-watch";
+  if (score >= 60) return "text-watch";
+  return "text-short";
 }
