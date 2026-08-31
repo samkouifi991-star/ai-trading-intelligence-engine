@@ -85,3 +85,38 @@ CREATE TABLE IF NOT EXISTS learning_records (
 CREATE INDEX IF NOT EXISTS idx_signals_engine_time ON signals(engine, timestamp_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_learning_instrument ON learning_records(predicted_instrument);
 CREATE INDEX IF NOT EXISTS idx_headlines_story ON news_headlines(story_id);
+
+-- One row per named data source (e.g. "calendar", "news", "marketData:XAUUSD",
+-- "gmail", "llm"). Every real fetch attempt updates its row so the Live Data
+-- Status page reflects actual outcomes, not a static config flag — and so
+-- that status is consistent across separate serverless invocations.
+CREATE TABLE IF NOT EXISTS connector_health (
+  source_key TEXT PRIMARY KEY,
+  status TEXT NOT NULL, -- 'live' | 'partial' | 'sample' | 'blocked'
+  detail TEXT NOT NULL,
+  last_attempt_utc TEXT NOT NULL,
+  last_success_utc TEXT
+);
+
+-- OAuth tokens for the Gmail Forex Factory alert ingestion. Single-row table
+-- (one connected Gmail account) since this is a single-operator system.
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+  provider TEXT PRIMARY KEY, -- 'gmail'
+  refresh_token TEXT NOT NULL,
+  access_token TEXT,
+  access_token_expires_utc TEXT,
+  connected_email TEXT,
+  connected_at_utc TEXT NOT NULL,
+  last_history_id TEXT
+);
+
+-- Captured once per day around 9:45 ET, before the day engine's 10:00 issue
+-- window opens, so "the system began collecting/analyzing before 10:00" is
+-- auditable rather than just asserted.
+CREATE TABLE IF NOT EXISTS premarket_snapshots (
+  id TEXT PRIMARY KEY,
+  trading_day TEXT NOT NULL, -- YYYY-MM-DD in America/New_York
+  captured_at_utc TEXT NOT NULL,
+  payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_premarket_day ON premarket_snapshots(trading_day DESC);

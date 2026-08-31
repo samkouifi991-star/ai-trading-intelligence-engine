@@ -83,3 +83,19 @@ export function nyNowLabel(date: Date = new Date()): string {
     hour12: true,
   }).format(date);
 }
+
+/** Today's date as YYYY-MM-DD in America/New_York, independent of the
+ * server's own timezone — used to key one pre-market snapshot per trading
+ * day regardless of where this process happens to run. */
+export function nyDateKey(date: Date = new Date()): string {
+  const fmt = new Intl.DateTimeFormat("en-CA", { timeZone: NY_TZ, year: "numeric", month: "2-digit", day: "2-digit" });
+  return fmt.format(date); // en-CA formats as YYYY-MM-DD
+}
+
+/** Minutes since 09:45 ET today (negative if before 09:45). Used to judge
+ * whether a captured pre-market snapshot is actually from "this morning's"
+ * 09:45 window or is stale/missing. */
+export function minutesSincePremarketTarget(date: Date = new Date()): number {
+  const { hour, minute } = nyParts(date);
+  return hour * 60 + minute - (9 * 60 + 45);
+}

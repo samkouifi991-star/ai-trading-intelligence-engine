@@ -248,16 +248,6 @@ export function updateExcursions(
   ).run(mfe, mae, learningRecordId);
 }
 
-export function getOpenLearningRecords(maxAgeHours = 30): any[] {
-  const db = getDb();
-  const cutoff = new Date(Date.now() - maxAgeHours * 3600_000).toISOString();
-  return db
-    .prepare(
-      `SELECT * FROM learning_records WHERE event_timestamp_utc > ? AND price_after_1d IS NULL ORDER BY event_timestamp_utc DESC`
-    )
-    .all(cutoff);
-}
-
 export function getLearningStats(): {
   totalEvents: number;
   tradedEvents: number;
@@ -277,4 +267,124 @@ export function getLearningStats(): {
     )
     .all() as any[];
   return { totalEvents, tradedEvents, byInstrument };
+}
+
+// ── OAuth tokens (Gmail Forex Factory alert ingestion) ────────────────────
+
+export interface OAuthTokenRow {
+  provider: string;
+  refreshToken: string;
+  accessToken: string | null;
+  accessTokenExpiresUtc: string | null;
+  connectedEmail: string | null;
+  connectedAtUtc: string;
+  lastHistoryId: string | null;
+}
+
+export function saveOAuthTokens(row: Omit<OAuthTokenRow, "connectedAtUtc"> & { connectedAtUtc?: string }): void {
+  const db = getDb();
+  db.prepare(
+    `INSERT INTO oauth_tokens (provider, refresh_token, access_token, access_token_expires_utc, connected_email, connected_at_utc, last_history_id)
+     VALUES (@provider, @refreshToken, @accessToken, @accessTokenExpiresUtc, @connectedEmail, @connectedAtUtc, @lastHistoryId)
+     ON CONFLICT(provider) DO UPDATE SET
+       refresh_token=excluded.refresh_token, access_token=excluded.access_token,
+       access_token_expires_utc=excluded.access_token_expires_utc,
+       connected_email=excluded.connected_email, last_history_id=excluded.last_history_id`
+  ).run({
+    provider: row.provider,
+    refreshToken: row.refreshToken,
+    accessToken: row.accessToken,
+    accessTokenExpiresUtc: row.accessTokenExpiresUtc,
+    connectedEmail: row.connectedEmail,
+    connectedAtUtc: row.connectedAtUtc ?? new Date().toISOString(),
+    lastHistoryId: row.lastHistoryId,
+  });
+}
+
+export function getOAuthTokens(provider: string): OAuthTokenRow | null {
+  const db = getDb();
+  const row = db.prepare(`SELECT * FROM oauth_tokens WHERE provider = ?`).get(provider) as any;
+  if (!row) return null;
+  return {
+    provider: row.provider,
+    refreshToken: row.refresh_token,
+    accessToken: row.access_token,
+    accessTokenExpiresUtc: row.access_token_expires_utc,
+    connectedEmail: row.connected_email,
+    connectedAtUtc: row.connected_at_utc,
+    lastHistoryId: row.last_history_id,
+  };
+}
+
+export function updateGmailHistoryId(historyId: string): void {
+  const db = getDb();
+  db.prepare(`UPDATE oauth_tokens SET last_history_id = ? WHERE provider = 'gmail'`).run(historyId);
+}
+
+export function deleteOAuthTokens(provider: string): void {
+  const db = getDb();
+  db.prepare(`DELETE FROM oauth_tokens WHERE provider = ?`).run(provider);
+}
+
+// ── Pre-market context snapshots ───────────────────────────────────────────
+
+export function savePremarketSnapshot(tradingDay: string, payload: unknown): string {
+  const db = getDb();
+  const id = randomUUID();
+  db.prepare(
+    `INSERT INTO premarket_snapshots (id, trading_day, captured_at_utc, payload_json) VALUES (?, ?, ?, ?)`
+  ).run(id, tradingDay, new Date().toISOString(), JSON.stringify(payload));
+  return id;
+}
+
+export function getLatestPremarketSnapshot(tradingDay?: string): { tradingDay: string; capturedAtUtc: string; payload: any } | null {
+  const db = getDb();
+  const row = tradingDay
+    ? (db
+        .prepare(`SELECT * FROM premarket_snapshots WHERE trading_day = ? ORDER BY captured_at_utc DESC LIMIT 1`)
+        .get(tradingDay) as any)
+    : (db.prepare(`SELECT * FROM premarket_snapshots ORDER BY captured_at_utc DESC LIMIT 1`).get() as any);
+  if (!row) return null;
+  return { tradingDay: row.trading_day, capturedAtUtc: row.captured_at_utc, payload: JSON.parse(row.payload_json) };
+}
+
+// ── Learning record follow-ups (reaction tracking) ─────────────────────────
+
+export function getAllOpenLearningRecordsForReaction(maxAgeHours = 30): {
+  id: string;
+  predictedInstrument: string;
+  predictedDirection: "LONG" | "SHORT";
+  eventTimestampUtc: string;
+  priceAtEvent: number | null;
+  priceAfter1m: number | null;
+  priceAfter5m: number | null;
+  priceAfter15m: number | null;
+  priceAfter30m: number | null;
+  priceAfter60m: number | null;
+  priceAfter4h: number | null;
+  priceAfter1d: number | null;
+  maxFavorableExcursion: number | null;
+  maxAdverseExcursion: number | null;
+}[] {
+  const db = getDb();
+  const cutoff = new Date(Date.now() - maxAgeHours * 3600_000).toISOString();
+  const rows = db
+    .prepare(`SELECT * FROM learning_records WHERE event_timestamp_utc > ? AND price_after_1d IS NULL ORDER BY event_timestamp_utc DESC`)
+    .all(cutoff) as any[];
+  return rows.map((r) => ({
+    id: r.id,
+    predictedInstrument: r.predicted_instrument,
+    predictedDirection: r.predicted_direction,
+    eventTimestampUtc: r.event_timestamp_utc,
+    priceAtEvent: r.price_at_event,
+    priceAfter1m: r.price_after_1m,
+    priceAfter5m: r.price_after_5m,
+    priceAfter15m: r.price_after_15m,
+    priceAfter30m: r.price_after_30m,
+    priceAfter60m: r.price_after_60m,
+    priceAfter4h: r.price_after_4h,
+    priceAfter1d: r.price_after_1d,
+    maxFavorableExcursion: r.max_favorable_excursion,
+    maxAdverseExcursion: r.max_adverse_excursion,
+  }));
 }

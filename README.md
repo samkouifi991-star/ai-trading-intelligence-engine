@@ -38,21 +38,82 @@ on demand (calendar + news ingestion, then both engines re-score).
 
 ## Live vs. sample data
 
-Every ingestion connector (`src/lib/ingestion/*`) is written against a real
-interface and ships a deterministic **sample-mode** provider so the entire
-pipeline — clustering, decay, the economic-surprise engine, both scoring
-engines, both dashboards — is fully exercisable with zero credentials. Each
-dashboard's header shows a `live`/`sample` pill per connector so it's never
-ambiguous which mode produced a given signal. See
-`src/lib/ingestion/README.md` for exactly what env vars flip each connector
-to live mode (Forex Factory has no public API, so "live" calendar/news means
-pointing at a licensed feed or your own scraper service that emits the same
-JSON shape — documented there).
+As of Phase 2, every ingestion connector **attempts real live data by
+default — no API key required for calendar, news, or market data**:
 
-Without `OPENAI_API_KEY` set, the AI News Understanding Engine
-(`src/lib/news/aiUnderstanding.ts`) falls back to a small keyword-based
-heuristic (clearly labeled, confidence capped at 40) instead of failing, so
-`npm run dev` works out of the box.
+| Source | Live implementation | Key required? |
+|---|---|---|
+| Economic calendar | `faireconomy.media`'s public JSON mirror of Forex Factory's own calendar data | No |
+| Breaking news | ForexLive's public RSS (Forex Factory has no public news feed — see below) | No |
+| Market prices (XAUUSD/ES/NQ/WTI/FX/DXY/VIX) | Yahoo Finance's public chart API | No |
+| US 2Y / US 10Y yields | FRED (Federal Reserve Economic Data) public CSV export | No |
+| Forex Factory email alerts | Gmail API (OAuth) | Yes — your own Google Cloud OAuth credentials |
+| AI News Understanding | OpenAI | Yes — `OPENAI_API_KEY` |
+
+If a live fetch fails for any reason (network egress blocked, the host is
+down, the API changed shape), that connector **falls back to sample data**
+so the pipeline keeps running end-to-end rather than crashing — but the
+failure is never hidden. Every real fetch attempt — success or failure — is
+recorded in the `connector_health` table and shown live on the **Live Data
+Status** dashboard tab as `LIVE` / `PARTIAL` / `SAMPLE` / `BLOCKED`, each
+with the actual error detail and timestamp. `SAMPLE` means "deliberately not
+configured yet" (e.g. Gmail, or the LLM without a key); `BLOCKED` means "a
+real attempt was made against the real host and it failed" — these are never
+conflated.
+
+**One honest substitution, stated plainly:** Forex Factory has no public
+breaking-news API — its news wire only exists behind the logged-in website
+UI, and scraping that HTML would be fragile and ToS-gray. The default live
+breaking-news source is therefore ForexLive's public RSS feed instead — a
+real, keyless, forex/macro-focused wire covering the same kind of catalysts.
+It is never relabeled as "Forex Factory" anywhere (code, database, or UI all
+say "ForexLive"). Set `FOREX_FACTORY_NEWS_URL` to a licensed FF feed if you
+have one — the connector interface doesn't care where headlines come from.
+
+See `src/lib/ingestion/README.md` for the full connector-by-connector
+breakdown and how to point each one at a different provider.
+
+## Phase 2 verification: a real end-to-end tick
+
+This development sandbox's outbound network policy blocks the actual data
+hosts above (faireconomy.media, Yahoo Finance, FRED, ForexLive — confirmed
+via explicit `403` policy denials, not transient errors), so a live fetch
+cannot be proven *from inside this sandbox*. What was verified here instead:
+
+1. **Every real parser is unit-tested against a fixture matching that API's
+   real, documented/observed response schema** (`npm test` —
+   `parseYahooChartResponse`, `parseFredCsv`, `mapFairEconomyRow`,
+   `mapRssItem`, `parseFeedNumber`) — 24/24 passing.
+2. **A real end-to-end tick was run** (`POST /api/analyze` against a live
+   `npm run dev` server) and produced this actual chain, in order:
+   - Calendar + news + Gmail-poll ingestion attempted live against the real
+     hosts → all four market/news hosts returned `403` (this sandbox's
+     policy) → `connector_health` correctly recorded `blocked` for each,
+     with the real HTTP status in the detail field → each connector fell
+     back to sample data so the pipeline continued.
+   - News clustering/decay ran on the (fallback) headlines and produced
+     real story records.
+   - The economic-surprise engine, cross-asset confirmation engine, and
+     both Day and Swing composite scorers ran on that data and produced
+     real `NO_TRADE`/`WATCH` decisions (e.g. `XAUUSD LONG, confidence 36,
+     NO_TRADE` — correctly below the 70-point threshold) — proving the
+     deterministic gate, not the LLM, is what decided nothing was
+     actionable.
+   - The learning database recorded 11 events across 4 instruments.
+   - `POST /api/premarket/capture` and `POST /api/learning/track-reactions`
+     both ran successfully against that same state.
+3. **`GET /api/status`** was inspected directly and showed the honest
+   picture: every market/news/calendar source `blocked` with its real error,
+   Gmail/LLM `sample` (not configured), nothing silently claiming `live`.
+
+This proves the wiring, the fallback behavior, and the decision chain are
+correct. It does **not** prove the live hosts return exactly the shape this
+build expects — that can only be confirmed by running a tick somewhere with
+real internet egress (deploy to Vercel, or run `npm run dev` on your own
+machine) and checking `/status`. If any parser needs adjusting once you do,
+each one's fixture-tested function (`mapFairEconomyRow`,
+`parseYahooChartResponse`, `parseFredCsv`, `mapRssItem`) is a single,
+isolated place to fix it.
 
 ## Architecture
 
@@ -96,16 +157,25 @@ src/lib/
     validation.ts               THE deterministic TRADE/WATCH/NO_TRADE gate
     signalBuilder.ts             assembles the full spec'd signal-output object
 
+  gmail/client.ts              Gmail OAuth2 client (connect/callback/refresh)
+
   pipeline/                   orchestration: ingest -> analyze -> score -> persist
+                              includes gmailPipeline.ts (poll + feed alerts into
+                              the news pipeline), reactionTracking.ts (fills in
+                              the learning DB's follow-up prices/MFE/MAE),
+                              premarketContext.ts (09:45 ET capture)
   db/                         SQLite "learning database" (schema.sql +
                               repository.ts) — every analyzed event is stored
                               whether or not it became a trade
 
 src/app/
-  day/page.tsx, swing/page.tsx   the two dashboard tabs
+  day/page.tsx, swing/page.tsx, status/page.tsx   the three dashboard tabs
   api/                          ingest/{calendar,news,email}, analyze,
                                  cron/tick, signals/{day,swing}, regime,
-                                 status, news/stories, economic/upcoming
+                                 status, news/stories, economic/upcoming,
+                                 gmail/{connect,callback,poll},
+                                 premarket/{capture,latest},
+                                 learning/track-reactions
 ```
 
 ## Scheduling
@@ -118,7 +188,27 @@ through the day, not just 10:00–13:00 ET, so the "begin collecting before
 10:00 so a complete regime is ready" requirement is satisfied by ticking
 early and often — the 10:00–13:00 ET restriction on *issuing new day-trade
 ideas* is enforced inside `signals/validation.ts`, independent of when this
-route happens to be called.
+route happens to be called. `runFullPipeline` (called by `/api/cron/tick`)
+already includes calendar, news, Gmail polling, both engines, and reaction
+tracking in one call — you only need a second scheduled hit for `GET
+/api/premarket/capture` around 09:45 ET daily.
+
+Example `vercel.json` cron config:
+
+```json
+{
+  "crons": [
+    { "path": "/api/cron/tick", "schedule": "*/5 * * * *" },
+    { "path": "/api/premarket/capture", "schedule": "45 13 * * 1-5" }
+  ]
+}
+```
+
+(09:45 ET is 13:45 UTC during EDT / 14:45 UTC during EST — adjust for
+daylight saving, or just tick frequently enough that a same-morning capture
+always lands close to 09:45 regardless.) Vercel Cron sends no auth header by
+default, so either leave `CRON_SECRET` unset or configure Vercel's
+[cron secret verification](https://vercel.com/docs/cron-jobs/manage-cron-jobs#securing-cron-jobs).
 
 ## Deploying to Vercel
 
@@ -160,13 +250,27 @@ running without anyone having the dashboard open.
   says so explicitly.
 - **Support/resistance** detection is a straightforward local-pivot scan
   over recent bars, not a full market-structure engine.
-- Sample-mode market data is a seeded random walk anchored to plausible
-  current price levels — good enough to exercise every downstream engine
-  end-to-end, not a real quote feed.
-- The **learning database**'s follow-up price columns (`price_after_5m`,
-  MFE/MAE, etc.) are schema-complete and written to by
-  `db/repository.ts`, but nothing currently schedules the follow-up price
-  polling job that would fill them in over time — wire a scheduled job
-  calling `recordFollowUpPrice`/`updateExcursions` against
-  `getOpenLearningRecords()` to activate the "which news types produce
-  reliable moves" learning loop described in the spec.
+- Sample-mode market data (used only as a fallback when a live fetch fails)
+  is a seeded random walk anchored to plausible current price levels — good
+  enough to keep the pipeline running end-to-end, not a real quote feed.
+- **US 2Y/US 10Y yields are daily-resolution**, not intraday — FRED settles
+  Treasury yields once per business day. `marketData:US2Y`/`US10Y` will show
+  `partial` if the latest observation is more than ~4 days old (e.g. a long
+  weekend), which is expected, not a bug.
+- **Gmail alert ingestion is polling, not push.** Each cron tick polls Gmail
+  for new alert emails since the last successful poll — "immediate" in
+  practice means "within one tick interval," not a true push webhook. A
+  Gmail `watch()` + Pub/Sub integration would close that gap; it's a
+  documented upgrade, not implemented here to avoid requiring a separate GCP
+  Pub/Sub topic just for this.
+- **Yahoo Finance and FRED are unofficial-but-widely-used free endpoints**,
+  not contractually guaranteed APIs — they can change shape or rate-limit
+  without notice. If that happens, `connector_health` will show `blocked`
+  with the real error rather than silently serving stale/wrong data, and the
+  fix is isolated to the relevant parser function (see "Phase 2
+  verification" above).
+- This build could not exercise a real live fetch against any of these hosts
+  from its authoring environment — its network policy blocks them (see
+  "Phase 2 verification" above). Confirm real connectivity by checking
+  `/status` after your first deploy or local `npm run dev` with real internet
+  access.

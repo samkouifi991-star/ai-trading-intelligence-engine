@@ -1,7 +1,9 @@
 import { ingestEconomicCalendar } from "./economicPipeline";
 import { ingestAndAnalyzeNews } from "./newsPipeline";
+import { pollGmailForexFactoryAlerts } from "./gmailPipeline";
 import { runDayEngine } from "./dayEngine";
 import { runSwingEngine } from "./swingEngine";
+import { trackReactions } from "./reactionTracking";
 import { getDaySessionPhase } from "../time/session";
 
 /**
@@ -10,8 +12,7 @@ import { getDaySessionPhase } from "../time/session";
  * invoked by an external scheduler (see app/api/cron/tick) roughly every few
  * minutes — Next.js on most hosts has no built-in always-on process, so
  * real-world scheduling is the caller's job (Vercel Cron, cron-job.org,
- * etc.), same pattern already used elsewhere in this monorepo
- * (see lib/orders.ts's releaseExpiredHolds for the precedent).
+ * etc.).
  *
  * The day engine runs on every tick regardless of session phase — before
  * 10:00 ET this keeps the regime/catalyst read warm ("system should begin
@@ -20,19 +21,23 @@ import { getDaySessionPhase } from "../time/session";
  * downgrades any would-be TRADE to WATCH outside 10:00-13:00 ET.
  */
 export async function runFullPipeline(now: Date = new Date()) {
-  const [calendar, news] = await Promise.all([
+  const [calendar, news, gmail] = await Promise.all([
     ingestEconomicCalendar(),
     ingestAndAnalyzeNews(),
+    pollGmailForexFactoryAlerts(),
   ]);
 
   const [day, swing] = await Promise.all([runDayEngine(now), runSwingEngine(now)]);
+  const reactions = await trackReactions(now);
 
   return {
     tickAtUtc: now.toISOString(),
     daySessionPhase: getDaySessionPhase(now),
     calendar,
     news,
+    gmail,
     day,
     swing,
+    reactions,
   };
 }

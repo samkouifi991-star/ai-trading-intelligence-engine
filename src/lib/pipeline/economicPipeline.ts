@@ -2,7 +2,7 @@ import { getCalendarConnector } from "../ingestion/forexFactoryCalendar";
 import { saveEconomicEvent } from "../db/repository";
 
 export async function ingestEconomicCalendar(): Promise<{
-  mode: "live" | "sample";
+  mode: "live";
   recentCount: number;
   upcomingCount: number;
 }> {

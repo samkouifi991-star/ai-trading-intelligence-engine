@@ -6,6 +6,7 @@ import { usePathname } from "next/navigation";
 const TABS = [
   { href: "/day", label: "Day Trading" },
   { href: "/swing", label: "Swing Trading" },
+  { href: "/status", label: "Live Data Status" },
 ];
 
 export default function NavTabs() {

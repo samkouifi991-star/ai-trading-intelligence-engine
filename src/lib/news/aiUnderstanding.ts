@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { REFERENCE_SERIES, TRADABLE_UNIVERSE } from "../universe";
 import type { NoveltyLevel, RawHeadline, StructuredNewsAnalysis } from "../types";
 import { callJsonLlm, isLlmConfigured } from "../llm/client";
+import { recordConnectorHealth } from "../ingestion/connectorHealth";
 
 const ASSET_SYMBOLS = [...TRADABLE_UNIVERSE.map((i) => i.symbol), ...REFERENCE_SERIES];
 
@@ -42,9 +43,13 @@ export async function analyzeStory(params: {
   novelty: NoveltyLevel;
 }): Promise<StructuredNewsAnalysis> {
   const latest = params.headlines[params.headlines.length - 1];
-  const base = isLlmConfigured()
-    ? await analyzeWithLlm(params.headlines)
-    : analyzeWithHeuristicFallback(params.headlines);
+  let base: LlmShape;
+  if (isLlmConfigured()) {
+    base = await analyzeWithLlm(params.headlines);
+  } else {
+    recordConnectorHealth("llm", "sample", "OPENAI_API_KEY not set — using keyword heuristic fallback");
+    base = analyzeWithHeuristicFallback(params.headlines);
+  }
 
   return {
     storyId: params.storyId,
@@ -82,9 +87,12 @@ async function analyzeWithLlm(headlines: RawHeadline[]): Promise<LlmShape> {
       system: SYSTEM_PROMPT,
       user: `Story headlines (oldest to newest):\n\n${context}`,
     });
+    recordConnectorHealth("llm", "live", "ok");
     return result;
   } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
     console.error("LLM news analysis failed, falling back to heuristic:", err);
+    recordConnectorHealth("llm", "blocked", detail);
     return analyzeWithHeuristicFallback(headlines);
   }
 }

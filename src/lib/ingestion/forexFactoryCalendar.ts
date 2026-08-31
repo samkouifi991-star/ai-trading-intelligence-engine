@@ -1,6 +1,9 @@
 import type { EconomicEvent } from "../types";
 import type { CalendarConnector } from "./types";
 import { hashString, mulberry32 } from "./seededRandom";
+import { withConnectorHealth } from "./connectorHealth";
+
+const SOURCE_KEY = "calendar";
 
 /** Reference indicators with their typical statistical shape, used both to
  * generate believable sample-mode calendar rows and as the seed catalog the
@@ -49,6 +52,8 @@ export function indicatorPolarity(eventName: string): "higher_hawkish" | "higher
   return "context_dependent";
 }
 
+// ── Sample-mode fallback (used only when the live feed can't be reached) ──
+
 function gaussian(rand: () => number, mean: number, stdDev: number): number {
   const u1 = Math.max(rand(), 1e-9);
   const u2 = rand();
@@ -81,7 +86,7 @@ function sampleEventAt(hoursOffset: number): EconomicEvent {
     previous,
     revisedPrevious,
     source: "sample-fixture",
-    description: `${spec.event} (${spec.currency}) — sample-mode fixture. Configure FOREX_FACTORY_CALENDAR_URL for a live structured feed.`,
+    description: `${spec.event} (${spec.currency}) — sample-mode fixture (live calendar feed unreachable).`,
   };
 }
 
@@ -104,48 +109,159 @@ class SampleCalendarConnector implements CalendarConnector {
   }
 }
 
-/** Live connector: expects FOREX_FACTORY_CALENDAR_URL to serve JSON rows
- * already shaped like EconomicEvent (or close to it — adjust the mapping
- * below to match your feed's actual schema). */
-class LiveCalendarConnector implements CalendarConnector {
-  constructor(private readonly baseUrl: string) {}
+// ── Live connector ──────────────────────────────────────────────────────
 
-  async fetchUpcoming(hoursAhead = 24): Promise<EconomicEvent[]> {
-    return this.fetch(`${this.baseUrl}?window=upcoming&hours=${hoursAhead}`);
+/**
+ * Forex Factory itself has no public REST API. `ff_calendar_thisweek.json`
+ * (served from faireconomy.media, the vendor Forex Factory's calendar widget
+ * partners have used for years) is a real, public, keyless mirror of FF's
+ * own calendar data — this is genuine FF calendar data, not a fabrication,
+ * just not fetched from forexfactory.com's own domain directly. Rows look
+ * like: {"title":"Non-Farm Payrolls","country":"USD","date":"2026-09-
+ * 05T12:30:00-04:00","impact":"High","forecast":"180K","previous":"175K",
+ * "actual":"187K"}. Set FOREX_FACTORY_CALENDAR_URL to point at a different
+ * (e.g. licensed/paid) feed instead — see src/lib/ingestion/README.md.
+ */
+const DEFAULT_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
+
+/** Values arrive as strings with embedded units: "180K", "3.2%", "-1.5M",
+ * "<0.1%", "  " (blank = not yet released), "4.50%-4.75%" (range — takes the
+ * midpoint). Returns null rather than guessing when the value is genuinely
+ * not a number (e.g. a qualitative/non-economic calendar row). */
+export function parseFeedNumber(raw: string | number | null | undefined): number | null {
+  if (raw === null || raw === undefined) return null;
+  if (typeof raw === "number") return Number.isFinite(raw) ? raw : null;
+  const trimmed = raw.trim();
+  if (trimmed === "" || trimmed === "-" || trimmed === "N/A") return null;
+
+  const rangeMatch = trimmed.match(/^(-?[\d.,]+)\s*%?\s*-\s*(-?[\d.,]+)\s*%$/);
+  if (rangeMatch) {
+    const a = parseFloat(rangeMatch[1].replace(/,/g, ""));
+    const b = parseFloat(rangeMatch[2].replace(/,/g, ""));
+    if (Number.isFinite(a) && Number.isFinite(b)) return (a + b) / 2;
   }
 
-  async fetchRecent(hoursBack = 24): Promise<EconomicEvent[]> {
-    return this.fetch(`${this.baseUrl}?window=recent&hours=${hoursBack}`);
-  }
-
-  private async fetch(url: string): Promise<EconomicEvent[]> {
-    const res = await fetch(url, { headers: { accept: "application/json" } });
-    if (!res.ok) {
-      throw new Error(`Calendar feed error ${res.status}: ${await res.text()}`);
-    }
-    const rows = (await res.json()) as any[];
-    return rows.map(mapRowToEvent);
-  }
+  const match = trimmed.replace(/,/g, "").match(/^(<|>)?(-?\d+(?:\.\d+)?)\s*([KMB%]?)$/i);
+  if (!match) return null;
+  const value = parseFloat(match[2]);
+  if (!Number.isFinite(value)) return null;
+  const suffix = match[3]?.toUpperCase();
+  const multiplier = suffix === "K" ? 1e3 : suffix === "M" ? 1e6 : suffix === "B" ? 1e9 : 1;
+  return value * multiplier;
 }
 
-function mapRowToEvent(row: any): EconomicEvent {
+function mapImpact(raw: string): "high" | "medium" | "low" {
+  const n = (raw ?? "").toLowerCase();
+  if (n.includes("high")) return "high";
+  if (n.includes("medium") || n.includes("med")) return "medium";
+  return "low";
+}
+
+/** Maps one faireconomy.media calendar row into our EconomicEvent shape.
+ * Exported for unit testing against a realistic fixture (see
+ * scripts/run-tests.ts) — this parser cannot be exercised against the real
+ * live endpoint from inside a network-restricted environment, so its
+ * correctness is verified against a hand-built fixture matching the feed's
+ * documented/observed schema instead. */
+export function mapFairEconomyRow(row: any): EconomicEvent | null {
+  const title = row.title ?? row.event;
+  const country = row.country ?? row.currency;
+  const date = row.date ?? row.eventTimeUtc;
+  if (!title || !country || !date) return null;
+
+  const eventTimeUtc = new Date(date).toISOString();
+  if (Number.isNaN(new Date(eventTimeUtc).getTime())) return null;
+
   return {
-    id: row.id ?? `${row.currency}-${row.event}-${row.eventTimeUtc ?? row.date}`,
-    event: row.event ?? row.title,
-    currency: row.currency,
-    eventTimeUtc: row.eventTimeUtc ?? row.date,
-    impact: (row.impact ?? "medium").toLowerCase(),
-    actual: row.actual ?? null,
-    forecast: row.forecast ?? null,
-    previous: row.previous ?? null,
-    revisedPrevious: row.revisedPrevious ?? row.revised_previous ?? null,
-    source: row.source ?? "forex-factory-live",
-    description: row.description ?? row.event ?? "",
+    id: `ff-${country}-${String(title).replace(/\s+/g, "-")}-${eventTimeUtc}`,
+    event: String(title),
+    currency: String(country).toUpperCase(),
+    eventTimeUtc,
+    impact: mapImpact(row.impact ?? ""),
+    actual: parseFeedNumber(row.actual),
+    forecast: parseFeedNumber(row.forecast),
+    previous: parseFeedNumber(row.previous),
+    revisedPrevious: null, // this feed does not carry a separate revised-previous field
+    source: "forexfactory-calendar-live",
+    description: `${title} (${country})`,
   };
 }
 
-export function getCalendarConnector(): { connector: CalendarConnector; mode: "live" | "sample" } {
-  const url = process.env.FOREX_FACTORY_CALENDAR_URL;
-  if (url) return { connector: new LiveCalendarConnector(url), mode: "live" };
-  return { connector: new SampleCalendarConnector(), mode: "sample" };
+async function fetchFairEconomyCalendar(url: string): Promise<EconomicEvent[]> {
+  const res = await fetch(url, { headers: { accept: "application/json" }, cache: "no-store" });
+  if (!res.ok) throw new Error(`Calendar feed HTTP ${res.status}`);
+  const rows = (await res.json()) as any[];
+  if (!Array.isArray(rows)) throw new Error("Calendar feed did not return an array");
+  return rows.map(mapFairEconomyRow).filter((e): e is EconomicEvent => e !== null);
+}
+
+class LiveCalendarConnector implements CalendarConnector {
+  constructor(private readonly url: string) {}
+
+  async fetchUpcoming(hoursAhead = 48): Promise<EconomicEvent[]> {
+    const all = await this.fetchAll();
+    const now = Date.now();
+    return all.filter((e) => {
+      const t = new Date(e.eventTimeUtc).getTime();
+      return t >= now && t <= now + hoursAhead * 3600_000;
+    });
+  }
+
+  async fetchRecent(hoursBack = 24): Promise<EconomicEvent[]> {
+    const all = await this.fetchAll();
+    const now = Date.now();
+    return all.filter((e) => {
+      const t = new Date(e.eventTimeUtc).getTime();
+      return t <= now && t >= now - hoursBack * 3600_000;
+    });
+  }
+
+  private async fetchAll(): Promise<EconomicEvent[]> {
+    return withConnectorHealth(SOURCE_KEY, async () => {
+      const events = await fetchFairEconomyCalendar(this.url);
+      if (events.length === 0) {
+        return { data: events, partial: "Feed reachable but returned zero parseable rows" };
+      }
+      return { data: events };
+    });
+  }
+}
+
+/**
+ * Always attempts the real live calendar first (no API key required — the
+ * feed is public). Only falls back to sample data if the live fetch fails
+ * (e.g. network egress blocked, feed schema changed) — connectorHealth
+ * records exactly which happened so the Live Data Status page never shows
+ * "live" for data that was actually a fallback.
+ */
+class SmartCalendarConnector implements CalendarConnector {
+  private live: LiveCalendarConnector;
+  private sample = new SampleCalendarConnector();
+
+  constructor(url: string) {
+    this.live = new LiveCalendarConnector(url);
+  }
+
+  async fetchUpcoming(hoursAhead = 48): Promise<EconomicEvent[]> {
+    try {
+      return await this.live.fetchUpcoming(hoursAhead);
+    } catch {
+      return this.sample.fetchUpcoming(hoursAhead);
+    }
+  }
+
+  async fetchRecent(hoursBack = 24): Promise<EconomicEvent[]> {
+    try {
+      return await this.live.fetchRecent(hoursBack);
+    } catch {
+      return this.sample.fetchRecent(hoursBack);
+    }
+  }
+}
+
+export function getCalendarConnector(): { connector: CalendarConnector; mode: "live" } {
+  const url = process.env.FOREX_FACTORY_CALENDAR_URL || DEFAULT_CALENDAR_URL;
+  // "mode" here just reflects that a live attempt is always made; the *actual*
+  // outcome of the most recent attempt is in connectorHealth, not this flag.
+  return { connector: new SmartCalendarConnector(url), mode: "live" };
 }

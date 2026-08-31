@@ -10,6 +10,9 @@ import { computeSwingScore } from "../src/lib/scoring/swingScore";
 import { decideFinalStatus } from "../src/lib/signals/validation";
 import { rankOpportunities } from "../src/lib/scoring/rank";
 import { getDaySessionPhase } from "../src/lib/time/session";
+import { mapFairEconomyRow, parseFeedNumber } from "../src/lib/ingestion/forexFactoryCalendar";
+import { parseYahooChartResponse, parseFredCsv } from "../src/lib/ingestion/marketData";
+import { mapRssItem } from "../src/lib/ingestion/forexFactoryNews";
 import type { TradeSignal } from "../src/lib/types";
 
 let passed = 0;
@@ -200,6 +203,120 @@ test("a lower-ranked correlated instrument (ES vs NQ) is suppressed", () => {
   assert.deepEqual(ranked.map((r) => r.signal.instrument), ["ES", "EURUSD"]);
   assert.equal(suppressed.length, 1);
   assert.equal(suppressed[0].signal.instrument, "NQ");
+});
+
+console.log("\nreal-data parsers (fixture-verified — live network is blocked in this dev sandbox by org egress");
+console.log("policy, so these prove parsing correctness against each API's real documented/observed schema)");
+
+test("parseFeedNumber handles FF calendar's unit suffixes", () => {
+  assert.equal(parseFeedNumber("180K"), 180000);
+  assert.equal(parseFeedNumber("3.2%"), 3.2);
+  assert.equal(parseFeedNumber("-1.5M"), -1500000);
+  assert.equal(parseFeedNumber(""), null);
+  assert.equal(parseFeedNumber("  "), null);
+  assert.equal(parseFeedNumber("4.50%-4.75%"), 4.625);
+  assert.equal(parseFeedNumber("<0.1%"), 0.1);
+});
+
+test("mapFairEconomyRow parses a realistic faireconomy.media calendar row", () => {
+  const row = {
+    title: "Non-Farm Payrolls",
+    country: "USD",
+    date: "2026-09-05T08:30:00-04:00",
+    impact: "High",
+    forecast: "180K",
+    previous: "175K",
+    actual: "187K",
+  };
+  const event = mapFairEconomyRow(row);
+  assert.ok(event);
+  assert.equal(event!.event, "Non-Farm Payrolls");
+  assert.equal(event!.currency, "USD");
+  assert.equal(event!.impact, "high");
+  assert.equal(event!.actual, 187000);
+  assert.equal(event!.forecast, 180000);
+  assert.equal(event!.previous, 175000);
+  assert.equal(event!.revisedPrevious, null);
+  assert.equal(new Date(event!.eventTimeUtc).toISOString(), event!.eventTimeUtc);
+});
+
+test("mapFairEconomyRow handles a non-numeric/holiday row without throwing", () => {
+  const row = { title: "Bank Holiday", country: "USD", date: "2026-09-07T00:00:00-04:00", impact: "Holiday", forecast: "", previous: "", actual: "" };
+  const event = mapFairEconomyRow(row);
+  assert.ok(event);
+  assert.equal(event!.actual, null);
+  assert.equal(event!.forecast, null);
+  assert.equal(event!.impact, "low"); // unrecognized impact string falls back to low, never crashes
+});
+
+test("mapFairEconomyRow returns null for a row missing required fields", () => {
+  assert.equal(mapFairEconomyRow({ title: "No date given", country: "USD" }), null);
+});
+
+test("parseYahooChartResponse parses a realistic chart response and drops null-padded gap bars", () => {
+  const fixture = {
+    chart: {
+      result: [
+        {
+          meta: { currency: "USD", symbol: "^GSPC", regularMarketPrice: 5712.34, previousClose: 5700.11 },
+          timestamp: [1735689600, 1735689660, 1735689720],
+          indicators: {
+            quote: [
+              {
+                open: [5700.5, null, 5705.2],
+                high: [5701.0, null, 5706.0],
+                low: [5699.8, null, 5704.5],
+                close: [5700.9, null, 5705.8],
+                volume: [1200, null, 1500],
+              },
+            ],
+          },
+        },
+      ],
+      error: null,
+    },
+  };
+  const result = parseYahooChartResponse(fixture, "^GSPC");
+  assert.equal(result.last, 5712.34);
+  assert.equal(result.previousClose, 5700.11);
+  assert.equal(result.bars.length, 2); // the null-padded middle minute is dropped
+  assert.equal(result.bars[0].close, 5700.9);
+  assert.equal(result.bars[1].close, 5705.8);
+});
+
+test("parseYahooChartResponse throws on Yahoo's own error shape", () => {
+  const fixture = { chart: { result: null, error: { code: "Not Found", description: "No data found" } } };
+  assert.throws(() => parseYahooChartResponse(fixture, "BADSYM"));
+});
+
+test("parseFredCsv picks the latest two real observations, skipping '.' (no-release) rows", () => {
+  const csv = "DATE,DGS10\n2026-08-25,4.15\n2026-08-26,4.12\n2026-08-27,.\n2026-08-28,4.18\n";
+  const { latest, previous } = parseFredCsv(csv);
+  assert.equal(latest.date, "2026-08-28");
+  assert.equal(latest.value, 4.18);
+  assert.equal(previous.date, "2026-08-26");
+  assert.equal(previous.value, 4.12);
+});
+
+test("mapRssItem parses a realistic ForexLive-style RSS item (CDATA, HTML body, pubDate)", () => {
+  const item = {
+    title: { __cdata: "Fed's Waller says rate cuts not imminent amid sticky inflation" },
+    link: "https://www.forexlive.com/News/!/feds-waller-123456",
+    pubDate: "Mon, 31 Aug 2026 12:00:00 GMT",
+    guid: "https://www.forexlive.com/?p=123456",
+    description: { __cdata: "<p>Fed governor Christopher Waller said Monday that rate cuts are <b>not imminent</b> given persistent inflation.</p>" },
+  };
+  const headline = mapRssItem(item, "ForexLive (real-time forex news wire)");
+  assert.ok(headline);
+  assert.equal(headline!.headline, "Fed's Waller says rate cuts not imminent amid sticky inflation");
+  assert.equal(headline!.source, "ForexLive (real-time forex news wire)");
+  assert.equal(headline!.url, "https://www.forexlive.com/News/!/feds-waller-123456");
+  assert.ok(!headline!.body!.includes("<"), "HTML tags should be stripped from the body");
+  assert.equal(new Date(headline!.timestampUtc).toISOString(), headline!.timestampUtc);
+});
+
+test("mapRssItem returns null for an item missing a title or pubDate", () => {
+  assert.equal(mapRssItem({ link: "https://x.test" }, "source"), null);
 });
 
 console.log(`\n${passed} test(s) passed.`);

@@ -24,16 +24,29 @@ export function DirectionPill({ direction }: { direction: "LONG" | "SHORT" }) {
   );
 }
 
+const MODE_STYLE: Record<string, string> = {
+  live: "bg-long/20 text-long",
+  partial: "bg-watch/20 text-watch",
+  sample: "bg-gray-600/20 text-gray-300",
+  blocked: "bg-short/20 text-short",
+  "heuristic-fallback": "bg-gray-600/20 text-gray-300",
+};
+
+const MODE_TITLE: Record<string, string> = {
+  live: "Live data — most recent fetch succeeded",
+  partial: "Live data, but degraded (see Live Data Status page)",
+  sample: "Sample/demo data — not configured, or no attempt made yet",
+  blocked: "A live fetch was attempted and failed — see Live Data Status page",
+  "heuristic-fallback": "OPENAI_API_KEY not set — using keyword heuristic instead of the LLM",
+};
+
 export function ModePill({ mode }: { mode: string }) {
-  const live = mode === "live";
   return (
     <span
-      className={`rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${
-        live ? "bg-long/20 text-long" : "bg-watch/20 text-watch"
-      }`}
-      title={live ? "Connected to a live feed" : "Sample/demo data — no live credentials configured"}
+      className={`rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide ${MODE_STYLE[mode] ?? MODE_STYLE.sample}`}
+      title={MODE_TITLE[mode] ?? mode}
     >
-      {live ? "live" : "sample"}
+      {mode}
     </span>
   );
 }

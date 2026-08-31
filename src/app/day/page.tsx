@@ -30,24 +30,37 @@ interface StatusApi {
   connectors: { calendar: string; news: string; marketData: string; llm: string };
 }
 
+interface PremarketApi {
+  freshness: "fresh" | "stale" | "missing";
+  capturedAtUtc: string | null;
+  context: {
+    regime: { summary: string };
+    overnightStories: { headline: string; severity: number; eventType: string; riskImpact: string }[];
+    todaysCalendar: { event: string; currency: string; impact: string; eventTimeUtc: string }[];
+  } | null;
+}
+
 export default function DayDashboard() {
   const [data, setData] = useState<DayApiResponse | null>(null);
   const [stories, setStories] = useState<StoryApi[]>([]);
   const [status, setStatus] = useState<StatusApi | null>(null);
   const [upcoming, setUpcoming] = useState<any[]>([]);
+  const [premarket, setPremarket] = useState<PremarketApi | null>(null);
   const [loading, setLoading] = useState(false);
 
   const loadCached = useCallback(async () => {
-    const [s, st, news, up] = await Promise.all([
+    const [s, st, news, up, pm] = await Promise.all([
       fetch("/api/signals/day").then((r) => r.json()),
       fetch("/api/status").then((r) => r.json()),
       fetch("/api/news/stories?horizon=day").then((r) => r.json()),
       fetch("/api/economic/upcoming").then((r) => r.json()),
+      fetch("/api/premarket/latest").then((r) => r.json()),
     ]);
     setData(s);
     setStatus(st);
     setStories(news.stories ?? []);
     setUpcoming(up.events ?? []);
+    setPremarket(pm);
   }, []);
 
   const refresh = useCallback(async () => {
@@ -102,6 +115,58 @@ export default function DayDashboard() {
             : "Trading window closed (after 13:00 ET) — no new day-trade ideas until tomorrow's 10:00 ET window. Monitoring/decay only."}
         </div>
       )}
+
+      <Card
+        title="Pre-Market Context (09:45 ET)"
+        right={
+          premarket && (
+            <span
+              className={`text-[10px] uppercase ${
+                premarket.freshness === "fresh" ? "text-long" : premarket.freshness === "stale" ? "text-watch" : "text-gray-500"
+              }`}
+            >
+              {premarket.freshness}
+              {premarket.capturedAtUtc ? ` · captured ${new Date(premarket.capturedAtUtc).toLocaleTimeString()}` : ""}
+            </span>
+          )
+        }
+      >
+        {!premarket?.context ? (
+          <p className="text-sm text-gray-500">
+            No pre-market snapshot captured yet today. POST /api/premarket/capture (schedule it ~09:45 ET) to populate this.
+          </p>
+        ) : (
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div>
+              <p className="mb-1 text-xs font-semibold uppercase text-gray-400">Overnight stories</p>
+              {premarket.context.overnightStories.length === 0 ? (
+                <p className="text-xs text-gray-500">Nothing material overnight.</p>
+              ) : (
+                <ul className="space-y-1 text-xs text-gray-300">
+                  {premarket.context.overnightStories.slice(0, 6).map((s, i) => (
+                    <li key={i}>• {s.headline} <span className="text-gray-500">(severity {s.severity})</span></li>
+                  ))}
+                </ul>
+              )}
+            </div>
+            <div>
+              <p className="mb-1 text-xs font-semibold uppercase text-gray-400">Today&apos;s calendar</p>
+              {premarket.context.todaysCalendar.length === 0 ? (
+                <p className="text-xs text-gray-500">No high/medium-impact events scheduled.</p>
+              ) : (
+                <ul className="space-y-1 text-xs text-gray-300">
+                  {premarket.context.todaysCalendar.slice(0, 6).map((e, i) => (
+                    <li key={i}>
+                      • {e.event} ({e.currency}) —{" "}
+                      {new Date(e.eventTimeUtc).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        )}
+      </Card>
 
       <div className="grid gap-4 lg:grid-cols-3">
         <Card title="Market Regime" className="lg:col-span-2">

@@ -14,7 +14,7 @@ import type { NewsStory, RawHeadline } from "../types";
 const MAX_HEADLINES_KEPT_PER_STORY = 12;
 
 export interface NewsIngestResult {
-  mode: "live" | "sample";
+  mode: "live";
   headlinesSeen: number;
   newStories: number;
   incrementalUpdates: number;
