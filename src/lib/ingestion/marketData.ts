@@ -2,6 +2,7 @@ import type { MacroSnapshot, MarketSnapshot, OhlcvBar } from "../types";
 import type { MarketDataConnector } from "./types";
 import { hashString, mulberry32 } from "./seededRandom";
 import { recordConnectorHealth, resolveLiveOrFallback } from "./connectorHealth";
+import { fetchWithTimeout } from "./fetchWithTimeout";
 import { isProductionMode, DataUnavailableError } from "../config/appMode";
 import { getPrimaryProvider, getFallbackProvider } from "../marketdata/registry";
 import { providerSymbol, isGlobalSessionOpen } from "../marketdata/instruments";
@@ -191,7 +192,7 @@ async function fetchFredSeries(seriesId: string): Promise<{ latest: { date: stri
   const sourceKey = `marketData:FRED_${seriesId}`;
   try {
     const url = `https://fred.stlouisfed.org/graph/fredgraph.csv?id=${encodeURIComponent(seriesId)}`;
-    const res = await fetch(url, { headers: { accept: "text/csv" }, cache: "no-store" });
+    const res = await fetchWithTimeout(url, { headers: { accept: "text/csv" }, cache: "no-store" }, 8000);
     if (!res.ok) throw new Error(`FRED HTTP ${res.status} for ${seriesId}`);
     const csv = await res.text();
     const result = parseFredCsv(csv);

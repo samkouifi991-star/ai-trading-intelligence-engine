@@ -7,8 +7,8 @@ import type { MacroRegime, NewsStory } from "../types";
 export interface PremarketContext {
   tradingDay: string;
   regime: MacroRegime;
-  overnightStories: { headline: string; severity: number; eventType: string; riskImpact: string }[];
-  todaysCalendar: { event: string; currency: string; impact: string; eventTimeUtc: string }[];
+  overnightStories: { headline: string; severity: number; eventType: string; riskImpact: string; originalSource: string }[];
+  todaysCalendar: { event: string; currency: string; impact: string; eventTimeUtc: string; source: string }[];
 }
 
 /**
@@ -31,7 +31,7 @@ export async function capturePremarketContext(now: Date = new Date()): Promise<P
 
   const todaysCalendar = getEventsInRange(now.toISOString(), endOfNyDayUtc(now))
     .filter((e) => e.impact === "high" || e.impact === "medium")
-    .map((e) => ({ event: e.event, currency: e.currency, impact: e.impact, eventTimeUtc: e.eventTimeUtc }));
+    .map((e) => ({ event: e.event, currency: e.currency, impact: e.impact, eventTimeUtc: e.eventTimeUtc, source: e.source }));
 
   const context: PremarketContext = { tradingDay: nyDateKey(now), regime, overnightStories, todaysCalendar };
   savePremarketSnapshot(context.tradingDay, context);
@@ -44,6 +44,7 @@ function summarizeStory(s: NewsStory) {
     severity: s.latestAnalysis.severity,
     eventType: s.latestAnalysis.eventType,
     riskImpact: s.latestAnalysis.riskImpact,
+    originalSource: s.latestAnalysis.originalSource,
   };
 }
 

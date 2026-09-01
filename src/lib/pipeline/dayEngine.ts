@@ -1,5 +1,5 @@
 import { TRADABLE_UNIVERSE } from "../universe";
-import { getRecentStories, getEventsInRange, saveSignal } from "../db/repository";
+import { getRecentStories, getEventsInRange, saveSignal, saveEngineTickSummary } from "../db/repository";
 import { decayedSeverity, currentDecayFactor } from "../news/decay";
 import { scoreEconomicSurprise, aggregateSurpriseScore } from "../economicSurprise/surpriseEngine";
 import { relevantCurrenciesForInstrument } from "./economicPipeline";
@@ -11,12 +11,15 @@ import { computeMacroRegime, marketRegimeScore as regimeScoreOf } from "../regim
 import { buildSignal } from "../signals/signalBuilder";
 import { rankOpportunities } from "../scoring/rank";
 import { computeDataQualityScore, dayRequiredSources } from "../dataQuality/dataQualityEngine";
-import type { Direction, MacroRegime, MacroSnapshot, NewsStory, TradeSignal } from "../types";
+import { getConnectorHealthFor } from "../ingestion/connectorHealth";
+import type { Direction, MacroRegime, MacroSnapshot, NewsStory, TickStatus, TradeSignal } from "../types";
 
 const MIN_DECAYED_SEVERITY_TO_CONSIDER = 8;
 const MIN_ABS_IMPACT_TO_CONSIDER = 12;
 
 export interface DayEngineResult {
+  tickStatus: Exclude<TickStatus, "LOADING">;
+  tickAtUtc: string;
   regimeSummary: string;
   candidates: TradeSignal[];
   ranked: TradeSignal[];
@@ -39,7 +42,9 @@ export async function runDayEngine(now: Date = new Date()): Promise<DayEngineRes
     regime = computeMacroRegime(macro);
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    return {
+    const result: DayEngineResult = {
+      tickStatus: "DATA_UNAVAILABLE",
+      tickAtUtc: new Date().toISOString(),
       regimeSummary: `Regime unavailable: ${reason}`,
       candidates: [],
       ranked: [],
@@ -48,6 +53,8 @@ export async function runDayEngine(now: Date = new Date()): Promise<DayEngineRes
         (i) => `${i.symbol}: required cross-market confirmation data unavailable (${reason}).`
       ),
     };
+    saveEngineTickSummary("DAY", result.tickStatus, result);
+    return result;
   }
 
   const allStories = getRecentStories(60);
@@ -113,6 +120,12 @@ export async function runDayEngine(now: Date = new Date()): Promise<DayEngineRes
       .map((e) => `${e.event} (${e.currency}, ${e.impact} impact) at ${e.eventTimeUtc}`);
 
     const dataQuality = computeDataQualityScore(dayRequiredSources(instrument.symbol));
+    const usesSampleData = dataQuality.breakdown.some((b) => b.status === "sample");
+    const provenance = dataQuality.breakdown.map((b) => ({
+      sourceKey: b.sourceKey,
+      status: b.status,
+      detail: getConnectorHealthFor(b.sourceKey)?.detail ?? "no fetch attempted yet this session",
+    }));
 
     const signal = buildSignal({
       engine: "DAY",
@@ -128,6 +141,8 @@ export async function runDayEngine(now: Date = new Date()): Promise<DayEngineRes
       upcomingRisks,
       newsImpactScore: impactScore,
       dataQualityScore: dataQuality.score,
+      usesSampleData,
+      provenance,
       now,
     });
 
@@ -137,13 +152,24 @@ export async function runDayEngine(now: Date = new Date()): Promise<DayEngineRes
 
   const { ranked, suppressed } = rankOpportunities(candidates);
 
-  return {
+  // DEGRADED (not READY) when at least one instrument was skipped this tick
+  // specifically because a required live market-data fetch failed — the
+  // macro snapshot succeeded, but some evaluations are incomplete. An
+  // instrument skipped merely for lacking a news catalyst is normal, not
+  // degraded.
+  const degraded = noTradeReasons.some((r) => r.includes("market data unavailable"));
+
+  const result: DayEngineResult = {
+    tickStatus: degraded ? "DEGRADED" : "READY",
+    tickAtUtc: new Date().toISOString(),
     regimeSummary: regime.summary,
     candidates,
     ranked: ranked.map((r) => r.signal),
     suppressed: suppressed.map((s) => ({ instrument: s.signal.instrument, reason: s.reason })),
     noTradeReasons,
   };
+  saveEngineTickSummary("DAY", result.tickStatus, result);
+  return result;
 }
 
 function pickStrongestCatalyst(

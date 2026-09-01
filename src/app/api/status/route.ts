@@ -4,6 +4,7 @@ import { isLlmConfigured } from "@/lib/llm/client";
 import { isGmailConfigured, isGmailConnected } from "@/lib/gmail/client";
 import { getLearningStats } from "@/lib/db/repository";
 import { getDaySessionPhase, nyNowLabel } from "@/lib/time/session";
+import { getAppMode } from "@/lib/config/appMode";
 
 function statusFor(health: ReturnType<typeof getAllConnectorHealth>, key: string): string {
   // "unknown" (not "sample") when no attempt has been recorded yet — e.g. a
@@ -16,6 +17,7 @@ export async function GET() {
   const health = getAllConnectorHealth();
 
   return NextResponse.json({
+    appMode: getAppMode(),
     nyNow: nyNowLabel(),
     daySessionPhase: getDaySessionPhase(),
     connectors: {

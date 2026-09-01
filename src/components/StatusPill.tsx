@@ -52,3 +52,18 @@ export function ModePill({ mode }: { mode: string }) {
     </span>
   );
 }
+
+/** A loud, unmissable badge for anything built from sample/fallback data
+ * (development mode only) — never presented indistinguishably from a real
+ * calendar event, news story, or signal (spec rule: sample data must always
+ * be visually obvious). */
+export function SampleDataBadge({ title }: { title?: string }) {
+  return (
+    <span
+      className="rounded border border-watch/50 bg-watch/15 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-watch"
+      title={title ?? "Built from sample/fallback data, not a live source — development mode only"}
+    >
+      Sample Data
+    </span>
+  );
+}

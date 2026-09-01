@@ -1,5 +1,6 @@
 import type { OhlcvBar } from "../../types";
 import type { MarketDataProvider, ProviderHealth, ProviderQuote } from "../types";
+import { fetchWithTimeout } from "../../ingestion/fetchWithTimeout";
 
 interface YahooChartResult {
   last: number;
@@ -48,10 +49,14 @@ export function parseYahooChartResponse(json: any, symbolForError: string): Yaho
 
 async function fetchYahooChart(yahooSymbol: string): Promise<YahooChartResult> {
   const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?interval=1m&range=1d`;
-  const res = await fetch(url, {
-    headers: { "User-Agent": "Mozilla/5.0 (compatible; ai-trading-intelligence-engine/1.0)", accept: "application/json" },
-    cache: "no-store",
-  });
+  const res = await fetchWithTimeout(
+    url,
+    {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; ai-trading-intelligence-engine/1.0)", accept: "application/json" },
+      cache: "no-store",
+    },
+    6000
+  );
   if (!res.ok) throw new Error(`Yahoo Finance HTTP ${res.status} for ${yahooSymbol}`);
   const json = await res.json();
   return parseYahooChartResponse(json, yahooSymbol);

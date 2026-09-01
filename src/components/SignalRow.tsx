@@ -1,5 +1,5 @@
 import type { TradeSignal } from "@/lib/types";
-import { DirectionPill, StatusPill } from "./StatusPill";
+import { DirectionPill, StatusPill, SampleDataBadge } from "./StatusPill";
 
 export default function SignalRow({ signal, rank }: { signal: TradeSignal; rank?: number }) {
   return (
@@ -11,6 +11,7 @@ export default function SignalRow({ signal, rank }: { signal: TradeSignal; rank?
             <span className="font-mono text-sm font-semibold">{signal.instrument}</span>
             <DirectionPill direction={signal.direction} />
             <StatusPill status={signal.finalStatus} />
+            {signal.usesSampleData && <SampleDataBadge title="One or more required sources for this signal were sample/fallback data, not live." />}
           </div>
           <p className="mt-0.5 truncate text-xs text-gray-400" title={signal.catalyst}>
             {signal.catalyst}

@@ -308,7 +308,7 @@ already includes calendar, news, Gmail polling, both engines, and reaction
 tracking in one call — you only need a second scheduled hit for `GET
 /api/premarket/capture` around 09:45 ET daily.
 
-Example `vercel.json` cron config:
+`vercel.json` at the repo root already contains this cron config:
 
 ```json
 {
@@ -324,6 +324,20 @@ daylight saving, or just tick frequently enough that a same-morning capture
 always lands close to 09:45 regardless.) Vercel Cron sends no auth header by
 default, so either leave `CRON_SECRET` unset or configure Vercel's
 [cron secret verification](https://vercel.com/docs/cron-jobs/manage-cron-jobs#securing-cron-jobs).
+
+**Vercel's Hobby plan restricts Cron Jobs to a daily schedule** (and a low
+job count) — `*/5 * * * *` above needs a Pro plan or higher to actually fire
+every 5 minutes; on Hobby, Vercel silently coerces it down to once a day,
+which is nowhere near often enough for an intraday day-trading engine. If
+you're on Hobby, either upgrade the Vercel project, or point a
+plan-independent external scheduler like
+[cron-job.org](https://cron-job.org) (free, real per-minute intervals) at
+`GET https://<your-deployment>/api/cron/tick` with an `Authorization: Bearer
+$CRON_SECRET` header instead — `vercel.json`'s cron config and an external
+scheduler can both be active at once with no conflict, since the route
+itself is idempotent per call. Either way, verify it's actually firing: the Day/Swing dashboards' Market/
+Macro Regime card shows "last tick <time>" (from `tickAtUtc`), which should
+be a few minutes old, not hours.
 
 ## Deploying to Vercel
 
@@ -356,6 +370,67 @@ leave unset to run on the heuristic news-analysis fallback) and `CRON_SECRET`
 callable). Add a Vercel Cron entry (`vercel.json` → `crons`) hitting
 `/api/cron/tick` with that bearer token every few minutes so ingestion keeps
 running without anyone having the dashboard open.
+
+## Credentials setup checklist
+
+Every variable below is documented in full in `.env.example`; this is just
+the same list re-sorted by "do I actually need this right now," since not
+everything gates a genuinely-live deployment the same way.
+
+**REQUIRED NOW** — without these, the deployment cannot be a real
+production instance, regardless of how many data sources are live:
+
+- `CRON_SECRET` — a random string. Without it, `/api/cron/tick` and
+  `/api/premarket/capture` are publicly callable by anyone with the URL.
+- A real network database + a `src/lib/db/db.ts`/`repository.ts`
+  reimplementation against it (see "Deploying to Vercel" above) — the
+  default `TRADING_DB_PATH=/tmp/trading.db` is wiped on every cold start and
+  is verification-only, never production storage.
+- `APP_MODE=production` — set only once the above two are done. This is the
+  single switch that turns off sample-data fallback entirely (spec rule 5);
+  leaving it at `development` in a "production" deployment is the one
+  configuration mistake that defeats every other safety mechanism in this
+  app.
+
+**OPTIONAL** — the app is genuinely live and safe without these; each one
+upgrades one specific source from a working-but-limited default to
+something better:
+
+- `OPENAI_API_KEY` (+ `OPENAI_MODEL`, default `gpt-4o-mini`) — without it,
+  AI News Understanding runs on a deterministic keyword heuristic instead of
+  the LLM. This is a real, working fallback (not sample data), and the
+  dashboards label it honestly as `heuristic-fallback`, never as `live`.
+- `TWELVE_DATA_API_KEY` + `MARKET_DATA_PROVIDER=twelvedata` — without these,
+  market data runs on Yahoo Finance's public chart API by default: real live
+  prices, keyless, but an unofficial endpoint with no SLA (see `getHealth()`
+  in `src/lib/marketdata/providers/yahoo.ts` — it reports `realtime: false`
+  honestly rather than overclaiming). Setting both switches the primary
+  provider to Twelve Data's paid low-latency REST feed (Yahoo remains the
+  automatic fallback either way — see `src/lib/marketdata/registry.ts`).
+- `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` (Gmail
+  Forex Factory alert ingestion) — a supplementary trigger source; direct
+  Forex Factory News scraping and the Forex Factory Calendar are already the
+  primary path and work without this.
+- `FOREX_FACTORY_CALENDAR_URL` / `FOREX_FACTORY_NEWS_URL` — only needed to
+  override the default keyless public sources with a licensed feed (e.g. a
+  paid Forex Factory Flex Account export).
+- `INBOUND_EMAIL_WEBHOOK_SECRET` — only needed if you use the inbound-email-
+  webhook alerting path instead of the Gmail OAuth path above.
+- `MARKET_DATA_API_KEY` / `MARKET_DATA_BASE_URL` — only needed to wire a
+  different premium REST vendor (a broker API, Polygon, etc.) instead of
+  Yahoo/Twelve Data.
+
+**NOT YET NEEDED** — nothing in this codebase currently reads these; there
+is no code path they would unlock today:
+
+- Any broker/execution API key. There is no order-execution engine in this
+  app by design (spec rule: the system issues signals, it never places
+  trades) — nothing to configure.
+- A CME direct-feed credential. `src/lib/marketdata/providers/cme.ts` is a
+  documented non-functional stub, not wired to any real endpoint.
+- A positioning/flows (CFTC COT-style) data source credential — not wired
+  up yet; the swing score's positioning/flows input is held at a fixed
+  neutral 50/100 placeholder rather than fabricated (see `swingEngine.ts`).
 
 ## Known limitations (stated plainly)
 

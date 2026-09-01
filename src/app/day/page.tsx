@@ -4,11 +4,15 @@ import { useCallback, useEffect, useState } from "react";
 import Card from "@/components/Card";
 import SignalRow from "@/components/SignalRow";
 import SignalDetail from "@/components/SignalDetail";
-import { ModePill } from "@/components/StatusPill";
+import DevModeBanner from "@/components/DevModeBanner";
+import { ModePill, SampleDataBadge } from "@/components/StatusPill";
+import { isSampleSource } from "@/lib/sampleData";
 import type { TradeSignal } from "@/lib/types";
 
 interface DayApiResponse {
   session: { phase: string; nyNow: string; minutesUntilActiveWindow: number; minutesRemainingInActiveWindow: number };
+  tickStatus?: "READY" | "DEGRADED" | "DATA_UNAVAILABLE" | "ERROR" | "LOADING";
+  tickAtUtc?: string;
   regimeSummary?: string;
   candidates: TradeSignal[];
   ranked: TradeSignal[];
@@ -16,15 +20,33 @@ interface DayApiResponse {
   noTradeReasons?: string[];
 }
 
+const TICK_STATUS_STYLE: Record<string, string> = {
+  READY: "bg-long/20 text-long",
+  DEGRADED: "bg-watch/20 text-watch",
+  DATA_UNAVAILABLE: "bg-short/20 text-short",
+  ERROR: "bg-short/20 text-short",
+  LOADING: "bg-gray-600/20 text-gray-400",
+};
+
+function TickStatusBadge({ status }: { status?: string }) {
+  const s = status ?? "LOADING";
+  return (
+    <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${TICK_STATUS_STYLE[s] ?? TICK_STATUS_STYLE.LOADING}`}>
+      {s.replace("_", " ")}
+    </span>
+  );
+}
+
 interface StoryApi {
   storyId: string;
   lastUpdatedUtc: string;
   currentDecayFactor: number;
   developmentCount: number;
-  latestAnalysis: { headline: string; severity: number; riskImpact: string; causalChain: string[] };
+  latestAnalysis: { headline: string; severity: number; riskImpact: string; causalChain: string[]; originalSource: string };
 }
 
 interface StatusApi {
+  appMode?: string;
   nyNow: string;
   daySessionPhase: string;
   connectors: { calendar: string; news: string; marketData: string; llm: string };
@@ -35,8 +57,8 @@ interface PremarketApi {
   capturedAtUtc: string | null;
   context: {
     regime: { summary: string };
-    overnightStories: { headline: string; severity: number; eventType: string; riskImpact: string }[];
-    todaysCalendar: { event: string; currency: string; impact: string; eventTimeUtc: string }[];
+    overnightStories: { headline: string; severity: number; eventType: string; riskImpact: string; originalSource: string }[];
+    todaysCalendar: { event: string; currency: string; impact: string; eventTimeUtc: string; source: string }[];
   } | null;
 }
 
@@ -47,6 +69,7 @@ export default function DayDashboard() {
   const [upcoming, setUpcoming] = useState<any[]>([]);
   const [premarket, setPremarket] = useState<PremarketApi | null>(null);
   const [loading, setLoading] = useState(false);
+  const [capturingPremarket, setCapturingPremarket] = useState(false);
 
   const loadCached = useCallback(async () => {
     const [s, st, news, up, pm] = await Promise.all([
@@ -73,6 +96,16 @@ export default function DayDashboard() {
     }
   }, [loadCached]);
 
+  const capturePremarketNow = useCallback(async () => {
+    setCapturingPremarket(true);
+    try {
+      await fetch("/api/premarket/capture-manual", { method: "POST" });
+      await loadCached();
+    } finally {
+      setCapturingPremarket(false);
+    }
+  }, [loadCached]);
+
   useEffect(() => {
     loadCached();
     const interval = setInterval(loadCached, 60_000);
@@ -86,6 +119,8 @@ export default function DayDashboard() {
 
   return (
     <div className="space-y-4">
+      <DevModeBanner appMode={status?.appMode} />
+
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2 text-sm text-gray-400">
           {status && (
@@ -119,21 +154,31 @@ export default function DayDashboard() {
       <Card
         title="Pre-Market Context (09:45 ET)"
         right={
-          premarket && (
-            <span
-              className={`text-[10px] uppercase ${
-                premarket.freshness === "fresh" ? "text-long" : premarket.freshness === "stale" ? "text-watch" : "text-gray-500"
-              }`}
+          <div className="flex items-center gap-2">
+            {premarket && (
+              <span
+                className={`text-[10px] uppercase ${
+                  premarket.freshness === "fresh" ? "text-long" : premarket.freshness === "stale" ? "text-watch" : "text-gray-500"
+                }`}
+              >
+                {premarket.freshness}
+                {premarket.capturedAtUtc ? ` · captured ${new Date(premarket.capturedAtUtc).toLocaleTimeString()}` : ""}
+              </span>
+            )}
+            <button
+              onClick={capturePremarketNow}
+              disabled={capturingPremarket}
+              className="whitespace-nowrap rounded-md border border-accent/60 px-2 py-1 text-[10px] font-semibold uppercase text-accent disabled:opacity-50"
             >
-              {premarket.freshness}
-              {premarket.capturedAtUtc ? ` · captured ${new Date(premarket.capturedAtUtc).toLocaleTimeString()}` : ""}
-            </span>
-          )
+              {capturingPremarket ? "Capturing…" : "Capture pre-market now"}
+            </button>
+          </div>
         }
       >
         {!premarket?.context ? (
           <p className="text-sm text-gray-500">
-            No pre-market snapshot captured yet today. POST /api/premarket/capture (schedule it ~09:45 ET) to populate this.
+            No pre-market snapshot captured yet today. Click &ldquo;Capture pre-market now&rdquo; above (or schedule
+            GET/POST /api/premarket/capture ~09:45 ET) to populate this.
           </p>
         ) : (
           <div className="grid gap-3 sm:grid-cols-2">
@@ -144,7 +189,10 @@ export default function DayDashboard() {
               ) : (
                 <ul className="space-y-1 text-xs text-gray-300">
                   {premarket.context.overnightStories.slice(0, 6).map((s, i) => (
-                    <li key={i}>• {s.headline} <span className="text-gray-500">(severity {s.severity})</span></li>
+                    <li key={i} className="flex items-center gap-1.5">
+                      <span>• {s.headline} <span className="text-gray-500">(severity {s.severity})</span></span>
+                      {isSampleSource(s.originalSource) && <SampleDataBadge />}
+                    </li>
                   ))}
                 </ul>
               )}
@@ -156,9 +204,12 @@ export default function DayDashboard() {
               ) : (
                 <ul className="space-y-1 text-xs text-gray-300">
                   {premarket.context.todaysCalendar.slice(0, 6).map((e, i) => (
-                    <li key={i}>
-                      • {e.event} ({e.currency}) —{" "}
-                      {new Date(e.eventTimeUtc).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                    <li key={i} className="flex items-center gap-1.5">
+                      <span>
+                        • {e.event} ({e.currency}) —{" "}
+                        {new Date(e.eventTimeUtc).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                      </span>
+                      {isSampleSource(e.source) && <SampleDataBadge />}
                     </li>
                   ))}
                 </ul>
@@ -169,8 +220,24 @@ export default function DayDashboard() {
       </Card>
 
       <div className="grid gap-4 lg:grid-cols-3">
-        <Card title="Market Regime" className="lg:col-span-2">
-          <p className="text-sm text-gray-300">{data?.regimeSummary ?? "Loading…"}</p>
+        <Card
+          title="Market Regime"
+          className="lg:col-span-2"
+          right={<TickStatusBadge status={data?.tickStatus} />}
+        >
+          {!data?.tickStatus || data.tickStatus === "LOADING" ? (
+            <p className="text-sm text-gray-500">
+              No engine tick has completed yet in this deployment. Click &ldquo;Refresh now&rdquo; above, or wait for
+              the scheduled tick — this will not resolve on its own until a tick actually runs.
+            </p>
+          ) : (
+            <>
+              <p className="text-sm text-gray-300">{data.regimeSummary ?? "—"}</p>
+              {data.tickAtUtc && (
+                <p className="mt-1 text-[10px] text-gray-500">last tick {new Date(data.tickAtUtc).toLocaleString()}</p>
+              )}
+            </>
+          )}
         </Card>
         <Card title="Next Important Event">
           {upcoming.length === 0 ? (
@@ -179,7 +246,9 @@ export default function DayDashboard() {
             <div className="space-y-1 text-xs">
               {upcoming.slice(0, 4).map((e) => (
                 <div key={e.id} className="flex justify-between gap-2">
-                  <span className="truncate text-gray-300">{e.event} ({e.currency})</span>
+                  <span className="flex min-w-0 items-center gap-1.5 truncate text-gray-300">
+                    {e.event} ({e.currency}){isSampleSource(e.source) && <SampleDataBadge />}
+                  </span>
                   <span className="whitespace-nowrap text-gray-500">
                     {new Date(e.eventTimeUtc ?? e.event_time_utc).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
                   </span>
@@ -254,7 +323,10 @@ export default function DayDashboard() {
             {stories.slice(0, 12).map((s) => (
               <div key={s.storyId} className="rounded-md border border-border bg-panel2 px-3 py-2 text-xs">
                 <div className="flex items-center justify-between gap-2">
-                  <span className="font-medium text-gray-200">{s.latestAnalysis.headline}</span>
+                  <span className="flex min-w-0 items-center gap-1.5 font-medium text-gray-200">
+                    <span className="truncate">{s.latestAnalysis.headline}</span>
+                    {isSampleSource(s.latestAnalysis.originalSource) && <SampleDataBadge />}
+                  </span>
                   <span className="whitespace-nowrap text-gray-500">
                     decay {Math.round(s.currentDecayFactor * 100)}%
                   </span>

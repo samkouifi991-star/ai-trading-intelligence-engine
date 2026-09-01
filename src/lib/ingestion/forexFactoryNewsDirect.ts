@@ -1,5 +1,6 @@
 import * as cheerio from "cheerio";
 import { hashString } from "./seededRandom";
+import { fetchWithTimeout } from "./fetchWithTimeout";
 import type { RawHeadline } from "../types";
 
 export interface ForexFactoryNewsItem extends RawHeadline {
@@ -21,14 +22,31 @@ const NEWS_URL = "https://www.forexfactory.com/news";
  * falls back to ForexLive (secondary) when this throws.
  */
 export async function fetchForexFactoryNewsDirect(): Promise<ForexFactoryNewsItem[]> {
-  const res = await fetch(NEWS_URL, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-      accept: "text/html,application/xhtml+xml",
+  const res = await fetchWithTimeout(
+    NEWS_URL,
+    {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        accept: "text/html,application/xhtml+xml",
+      },
+      cache: "no-store",
     },
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`Forex Factory news page HTTP ${res.status}`);
+    8000
+  );
+  if (!res.ok) {
+    // 403/503 with a Cloudflare/anti-bot signature is the single most likely
+    // real-world failure mode for a direct scrape of a site with bot
+    // protection — call it out explicitly rather than a bare HTTP code, so
+    // the Live Data Status page's detail column names the actual cause.
+    const server = res.headers.get("server") ?? "";
+    const antiBot =
+      (res.status === 403 || res.status === 503) && /cloudflare/i.test(server)
+        ? " — response headers indicate Cloudflare anti-bot protection rejected this request"
+        : res.status === 403 || res.status === 429
+          ? " — likely blocked by anti-bot/rate-limit protection"
+          : "";
+    throw new Error(`Forex Factory news page HTTP ${res.status}${antiBot}`);
+  }
   const html = await res.text();
   const items = parseForexFactoryNewsHtml(html);
   if (items.length === 0) {

@@ -366,6 +366,8 @@ test("a lower-ranked correlated instrument (ES vs NQ) is suppressed", () => {
     marketRegimeScore: null,
     dataQualityScore: 100,
     dataQualityReason: null,
+    usesSampleData: false,
+    provenance: [],
     entryZone: null,
     invalidation: null,
     target1: null,

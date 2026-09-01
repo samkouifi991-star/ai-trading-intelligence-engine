@@ -3,10 +3,14 @@
 import { useCallback, useEffect, useState } from "react";
 import Card from "@/components/Card";
 import SignalDetail from "@/components/SignalDetail";
-import { ModePill } from "@/components/StatusPill";
+import DevModeBanner from "@/components/DevModeBanner";
+import { ModePill, SampleDataBadge } from "@/components/StatusPill";
+import { isSampleSource } from "@/lib/sampleData";
 import type { TradeSignal } from "@/lib/types";
 
 interface SwingApiResponse {
+  tickStatus?: "READY" | "DEGRADED" | "DATA_UNAVAILABLE" | "ERROR" | "LOADING";
+  tickAtUtc?: string;
   regimeSummary?: string;
   centralBankBias?: string;
   activeThemes?: string[];
@@ -16,7 +20,25 @@ interface SwingApiResponse {
   noIdeaReasons?: string[];
 }
 
+const TICK_STATUS_STYLE: Record<string, string> = {
+  READY: "bg-long/20 text-long",
+  DEGRADED: "bg-watch/20 text-watch",
+  DATA_UNAVAILABLE: "bg-short/20 text-short",
+  ERROR: "bg-short/20 text-short",
+  LOADING: "bg-gray-600/20 text-gray-400",
+};
+
+function TickStatusBadge({ status }: { status?: string }) {
+  const s = status ?? "LOADING";
+  return (
+    <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${TICK_STATUS_STYLE[s] ?? TICK_STATUS_STYLE.LOADING}`}>
+      {s.replace("_", " ")}
+    </span>
+  );
+}
+
 interface StatusApi {
+  appMode?: string;
   nyNow: string;
   connectors: { calendar: string; news: string; marketData: string; llm: string };
 }
@@ -59,6 +81,8 @@ export default function SwingDashboard() {
 
   return (
     <div className="space-y-4">
+      <DevModeBanner appMode={status?.appMode} />
+
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2 text-sm text-gray-400">
           {status && (
@@ -81,8 +105,24 @@ export default function SwingDashboard() {
       </div>
 
       <div className="grid gap-4 lg:grid-cols-3">
-        <Card title="Macro Regime" className="lg:col-span-2">
-          <p className="text-sm text-gray-300">{data?.regimeSummary ?? "Loading…"}</p>
+        <Card
+          title="Macro Regime"
+          className="lg:col-span-2"
+          right={<TickStatusBadge status={data?.tickStatus} />}
+        >
+          {!data?.tickStatus || data.tickStatus === "LOADING" ? (
+            <p className="text-sm text-gray-500">
+              No engine tick has completed yet in this deployment. Click &ldquo;Refresh now&rdquo; above, or wait for
+              the scheduled tick — this will not resolve on its own until a tick actually runs.
+            </p>
+          ) : (
+            <>
+              <p className="text-sm text-gray-300">{data.regimeSummary ?? "—"}</p>
+              {data.tickAtUtc && (
+                <p className="mt-1 text-[10px] text-gray-500">last tick {new Date(data.tickAtUtc).toLocaleString()}</p>
+              )}
+            </>
+          )}
         </Card>
         <Card title="Central-Bank Bias">
           <p className="text-sm text-gray-300">{data?.centralBankBias ?? "—"}</p>
@@ -135,7 +175,9 @@ export default function SwingDashboard() {
             <div className="space-y-1 text-xs">
               {upcoming.slice(0, 8).map((e) => (
                 <div key={e.id} className="flex justify-between gap-2">
-                  <span className="truncate text-gray-300">{e.event} ({e.currency})</span>
+                  <span className="flex min-w-0 items-center gap-1.5 truncate text-gray-300">
+                    {e.event} ({e.currency}){isSampleSource(e.source) && <SampleDataBadge />}
+                  </span>
                   <span className="whitespace-nowrap text-gray-500">
                     {new Date(e.eventTimeUtc ?? e.event_time_utc).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
                   </span>

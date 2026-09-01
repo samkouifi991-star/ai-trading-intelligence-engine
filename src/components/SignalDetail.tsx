@@ -1,5 +1,6 @@
 import type { TradeSignal } from "@/lib/types";
-import { DirectionPill, StatusPill } from "./StatusPill";
+import { DirectionPill, StatusPill, SampleDataBadge } from "./StatusPill";
+import { sourceLabel } from "@/lib/provenance";
 
 function fmt(n: number | null, digits = 4): string {
   if (n === null || Number.isNaN(n)) return "—";
@@ -15,6 +16,7 @@ export default function SignalDetail({ signal }: { signal: TradeSignal }) {
           <DirectionPill direction={signal.direction} />
           <StatusPill status={signal.finalStatus} />
           <span className="text-xs text-gray-500">{signal.engine}</span>
+          {signal.usesSampleData && <SampleDataBadge title="One or more required sources for this signal were sample/fallback data, not live." />}
         </div>
         <div className="text-right">
           <div className="text-2xl font-bold tabular-nums">{signal.confidence}</div>
@@ -40,6 +42,23 @@ export default function SignalDetail({ signal }: { signal: TradeSignal }) {
         <span className={`font-mono font-bold ${dataQualityColor(signal.dataQualityScore)}`}>{signal.dataQualityScore}/100</span>
         {signal.dataQualityReason && <span className="text-gray-500">— {signal.dataQualityReason}</span>}
       </div>
+
+      {signal.provenance.length > 0 && (
+        <div className="mt-2">
+          <h4 className="mb-1 text-[10px] font-semibold uppercase text-gray-500">Data Provenance</h4>
+          <div className="grid gap-1 sm:grid-cols-2">
+            {signal.provenance.map((p) => (
+              <div key={p.sourceKey} className="flex items-center gap-1.5 truncate text-[11px]" title={p.detail}>
+                <span className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${PROVENANCE_DOT[p.status] ?? PROVENANCE_DOT.unknown}`} />
+                <span className="truncate text-gray-400">{sourceLabel(p.sourceKey)}</span>
+                <span className={`shrink-0 font-mono text-[10px] font-semibold uppercase ${PROVENANCE_TEXT[p.status] ?? PROVENANCE_TEXT.unknown}`}>
+                  {p.status}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="mt-3 grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
         <Metric label="Entry" value={signal.entryZone ? `${fmt(signal.entryZone[0])} – ${fmt(signal.entryZone[1])}` : "—"} />
@@ -124,6 +143,22 @@ function SignedMetric({ label, value }: { label: string; value: number | null })
     </div>
   );
 }
+
+const PROVENANCE_DOT: Record<string, string> = {
+  live: "bg-long",
+  partial: "bg-watch",
+  sample: "bg-gray-400",
+  blocked: "bg-short",
+  unknown: "bg-gray-600",
+};
+
+const PROVENANCE_TEXT: Record<string, string> = {
+  live: "text-long",
+  partial: "text-watch",
+  sample: "text-gray-400",
+  blocked: "text-short",
+  unknown: "text-gray-500",
+};
 
 function dataQualityColor(score: number): string {
   if (score >= 90) return "text-long";

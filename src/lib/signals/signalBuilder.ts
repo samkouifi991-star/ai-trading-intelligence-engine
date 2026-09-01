@@ -28,6 +28,8 @@ export interface BuildSignalParams {
    * understanding engine, if this signal originated from a story. */
   newsImpactScore?: number | null;
   dataQualityScore: number;
+  usesSampleData: boolean;
+  provenance: TradeSignal["provenance"];
   now?: Date;
 }
 
@@ -63,6 +65,8 @@ export function buildSignal(params: BuildSignalParams): TradeSignal {
     marketRegimeScore: "marketRegimeScore" in params.breakdown ? params.breakdown.marketRegimeScore : null,
     dataQualityScore: params.dataQualityScore,
     dataQualityReason,
+    usesSampleData: params.usesSampleData,
+    provenance: params.provenance,
     entryZone,
     invalidation,
     target1,

@@ -2,9 +2,11 @@ import { randomUUID } from "node:crypto";
 import { getDb } from "./db";
 import type {
   EconomicEvent,
+  Engine,
   LearningRecord,
   NewsStory,
   RawHeadline,
+  TickStatus,
   TradeSignal,
 } from "../types";
 
@@ -184,6 +186,36 @@ export function getRecentSignals(engine: "DAY" | "SWING", limit = 50): TradeSign
     )
     .all(engine, limit) as { payload_json: string }[];
   return rows.map((r) => JSON.parse(r.payload_json));
+}
+
+// ── Engine tick summaries (so cached API reads never hang on "Loading") ────
+
+export interface EngineTickSummary {
+  engine: Engine;
+  status: Exclude<TickStatus, "LOADING">;
+  tickAtUtc: string;
+  summary: Record<string, unknown>;
+}
+
+export function saveEngineTickSummary(
+  engine: Engine,
+  status: Exclude<TickStatus, "LOADING">,
+  summary: object
+): void {
+  const db = getDb();
+  db.prepare(
+    `INSERT INTO engine_tick_summary (engine, status, tick_at_utc, summary_json)
+     VALUES (@engine, @status, @tickAtUtc, @summaryJson)
+     ON CONFLICT(engine) DO UPDATE SET
+       status=excluded.status, tick_at_utc=excluded.tick_at_utc, summary_json=excluded.summary_json`
+  ).run({ engine, status, tickAtUtc: new Date().toISOString(), summaryJson: JSON.stringify(summary) });
+}
+
+export function getEngineTickSummary(engine: Engine): EngineTickSummary | null {
+  const db = getDb();
+  const row = db.prepare(`SELECT * FROM engine_tick_summary WHERE engine = ?`).get(engine) as any;
+  if (!row) return null;
+  return { engine: row.engine, status: row.status, tickAtUtc: row.tick_at_utc, summary: JSON.parse(row.summary_json) };
 }
 
 // ── Learning records ─────────────────────────────────────────────────────

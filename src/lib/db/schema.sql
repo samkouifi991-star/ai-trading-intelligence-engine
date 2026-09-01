@@ -102,6 +102,17 @@ CREATE TABLE IF NOT EXISTS connector_health (
   market_open INTEGER       -- 0/1 — is the relevant market open right now (instrument sources only)?
 );
 
+-- Last completed tick per engine, so a cached (non-fresh) API read can still
+-- show the regime/themes/no-trade-reasons from the last real run instead of
+-- hanging on "Loading" until someone happens to hit ?fresh=1. One row per
+-- engine, overwritten on every tick (fresh=1 request or scheduled cron).
+CREATE TABLE IF NOT EXISTS engine_tick_summary (
+  engine TEXT PRIMARY KEY, -- 'DAY' | 'SWING'
+  status TEXT NOT NULL,    -- 'READY' | 'DEGRADED' | 'DATA_UNAVAILABLE' | 'ERROR'
+  tick_at_utc TEXT NOT NULL,
+  summary_json TEXT NOT NULL
+);
+
 -- OAuth tokens for the Gmail Forex Factory alert ingestion. Single-row table
 -- (one connected Gmail account) since this is a single-operator system.
 CREATE TABLE IF NOT EXISTS oauth_tokens (

@@ -1,5 +1,6 @@
 import type { OhlcvBar } from "../../types";
 import type { MarketDataProvider, ProviderHealth, ProviderQuote } from "../types";
+import { fetchWithTimeout } from "../../ingestion/fetchWithTimeout";
 
 /**
  * Real Twelve Data REST + WebSocket integration, gated behind
@@ -28,7 +29,7 @@ export class TwelveDataProvider implements MarketDataProvider {
   async getQuote(providerSymbol: string): Promise<ProviderQuote> {
     const start = Date.now();
     const url = `https://api.twelvedata.com/price?symbol=${encodeURIComponent(providerSymbol)}&apikey=${this.apiKey}`;
-    const res = await fetch(url, { cache: "no-store" });
+    const res = await fetchWithTimeout(url, { cache: "no-store" }, 6000);
     if (!res.ok) throw new Error(`Twelve Data HTTP ${res.status} for ${providerSymbol}`);
     const json = await res.json();
     this.lastLatencyMs = Date.now() - start;
@@ -43,7 +44,7 @@ export class TwelveDataProvider implements MarketDataProvider {
     const interval = `${opts?.intervalMinutes ?? 1}min`;
     const outputsize = opts?.count ?? 120;
     const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(providerSymbol)}&interval=${interval}&outputsize=${outputsize}&apikey=${this.apiKey}`;
-    const res = await fetch(url, { cache: "no-store" });
+    const res = await fetchWithTimeout(url, { cache: "no-store" }, 6000);
     if (!res.ok) throw new Error(`Twelve Data HTTP ${res.status} for ${providerSymbol}`);
     const json = await res.json();
     this.lastLatencyMs = Date.now() - start;

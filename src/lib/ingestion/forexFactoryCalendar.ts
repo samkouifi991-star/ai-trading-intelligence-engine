@@ -2,6 +2,7 @@ import type { EconomicEvent } from "../types";
 import type { CalendarConnector } from "./types";
 import { hashString, mulberry32 } from "./seededRandom";
 import { withConnectorHealth, resolveLiveOrFallback } from "./connectorHealth";
+import { fetchWithTimeout } from "./fetchWithTimeout";
 
 const SOURCE_KEY = "calendar";
 
@@ -189,7 +190,7 @@ export function mapFairEconomyRow(row: any): EconomicEvent | null {
 }
 
 async function fetchFairEconomyCalendar(url: string): Promise<EconomicEvent[]> {
-  const res = await fetch(url, { headers: { accept: "application/json" }, cache: "no-store" });
+  const res = await fetchWithTimeout(url, { headers: { accept: "application/json" }, cache: "no-store" }, 8000);
   if (!res.ok) throw new Error(`Calendar feed HTTP ${res.status}`);
   const rows = (await res.json()) as any[];
   if (!Array.isArray(rows)) throw new Error("Calendar feed did not return an array");

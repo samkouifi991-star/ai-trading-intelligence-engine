@@ -3,6 +3,13 @@
 export type Engine = "DAY" | "SWING";
 export type Direction = "LONG" | "SHORT";
 export type FinalStatus = "TRADE" | "WATCH" | "NO_TRADE";
+// READY: tick completed normally. DEGRADED: tick completed but one or more
+// instruments were skipped because a required live source failed mid-tick.
+// DATA_UNAVAILABLE: the shared macro snapshot itself could not be fetched,
+// so nothing could be evaluated this tick. ERROR: the tick threw before it
+// could even determine that. The dashboard must show one of these, or
+// LOADING (no tick has ever completed) — never hang indefinitely.
+export type TickStatus = "READY" | "DEGRADED" | "DATA_UNAVAILABLE" | "ERROR" | "LOADING";
 
 // ── Economic calendar ────────────────────────────────────────────────────
 
@@ -282,6 +289,19 @@ export interface TradeSignal {
    * that gate's reasoning is preserved here for display. */
   dataQualityScore: number;
   dataQualityReason: string | null;
+  /** True when at least one of this signal's required sources (see
+   * dataQualityEngine.ts's day/swingRequiredSources) was actually served
+   * from sample/fallback data on this tick (APP_MODE=development only — in
+   * production this can never be true, since a required-source failure
+   * throws DataUnavailableError instead of falling back). Never mix sample
+   * and live inputs without a visible indicator (spec rule 5). */
+  usesSampleData: boolean;
+  /** Full provenance for every required source behind this specific signal
+   * — which connector, whether its last attempt was actually live, and
+   * what happened. Built directly from that source's real connector_health
+   * row at signal-build time (see dataQualityEngine.ts), never guessed:
+   * "no signal should simply show a score without provenance." */
+  provenance: { sourceKey: string; status: "live" | "partial" | "sample" | "blocked" | "unknown"; detail: string }[];
 
   entryZone: [number, number] | null;
   invalidation: number | null;

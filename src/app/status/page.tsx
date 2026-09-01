@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import Card from "@/components/Card";
+import DevModeBanner from "@/components/DevModeBanner";
 
 interface ConnectorHealth {
   sourceKey: string;
@@ -16,6 +17,7 @@ interface ConnectorHealth {
 }
 
 interface StatusApi {
+  appMode?: string;
   nyNow: string;
   daySessionPhase: string;
   gmail: { configured: boolean; connected: boolean };
@@ -94,9 +96,12 @@ function formatLatency(health: ConnectorHealth | undefined): string {
 function Row({ row, health }: { row: (typeof ROWS)[number]; health: ConnectorHealth | undefined }) {
   const status = health?.status ?? "unknown";
   return (
-    <tr className="border-b border-border/60 last:border-0">
-      <td className="py-1.5 pr-3 text-sm text-gray-200" title={health?.detail ?? "no attempt recorded yet"}>
-        {row.label}
+    <tr className="border-b border-border/60 last:border-0 align-top">
+      <td className="py-1.5 pr-3">
+        <div className="text-sm text-gray-200">{row.label}</div>
+        <div className={`mt-0.5 max-w-md text-xs ${status === "blocked" ? "text-short/90" : "text-gray-500"}`}>
+          {health?.detail ?? "No fetch attempted yet this session."}
+        </div>
       </td>
       <td className="py-1.5 pr-3">
         <StatusBadge status={status} />
@@ -137,6 +142,8 @@ export default function LiveDataStatusPage() {
 
   return (
     <div className="space-y-4">
+      <DevModeBanner appMode={status?.appMode} />
+
       <div className="flex items-center justify-between gap-4">
         <p className="text-sm text-gray-400">
           Every row reflects the outcome of its most recent real fetch attempt — never a static config flag. LIVE

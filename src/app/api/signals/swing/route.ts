@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { runSwingEngine } from "@/lib/pipeline/swingEngine";
-import { getRecentSignals } from "@/lib/db/repository";
+import { getRecentSignals, getEngineTickSummary, saveEngineTickSummary } from "@/lib/db/repository";
 
 export async function GET(request: Request) {
   const url = new URL(request.url);
@@ -11,8 +11,20 @@ export async function GET(request: Request) {
       return NextResponse.json(result);
     }
     const recent = getRecentSignals("SWING", 50);
-    return NextResponse.json({ candidates: recent, ranked: recent, cached: true });
+    const tick = getEngineTickSummary("SWING");
+    if (!tick) {
+      return NextResponse.json({ candidates: recent, ranked: recent, cached: true, tickStatus: "LOADING" });
+    }
+    return NextResponse.json({
+      ...tick.summary,
+      candidates: recent,
+      ranked: recent,
+      cached: true,
+      tickStatus: tick.status,
+      tickAtUtc: tick.tickAtUtc,
+    });
   } catch (err) {
-    return NextResponse.json({ error: String(err) }, { status: 500 });
+    saveEngineTickSummary("SWING", "ERROR", { error: String(err) });
+    return NextResponse.json({ error: String(err), tickStatus: "ERROR" }, { status: 500 });
   }
 }

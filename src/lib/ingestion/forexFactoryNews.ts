@@ -4,6 +4,7 @@ import type { NewsConnector } from "./types";
 import { hashString, mulberry32 } from "./seededRandom";
 import { withConnectorHealth, resolveLiveOrFallback } from "./connectorHealth";
 import { fetchForexFactoryNewsDirect } from "./forexFactoryNewsDirect";
+import { fetchWithTimeout } from "./fetchWithTimeout";
 
 const PRIMARY_KEY = "news:forexfactory";
 const SECONDARY_KEY = "news:forexlive";
@@ -69,7 +70,7 @@ async function fetchPrimary(overrideUrl: string | undefined): Promise<RawHeadlin
 }
 
 async function fetchJsonFeed(url: string): Promise<RawHeadline[]> {
-  const res = await fetch(url, { headers: { accept: "application/json" }, cache: "no-store" });
+  const res = await fetchWithTimeout(url, { headers: { accept: "application/json" }, cache: "no-store" }, 8000);
   if (!res.ok) throw new Error(`News feed HTTP ${res.status}`);
   const rows = (await res.json()) as any[];
   return rows.map(
@@ -143,7 +144,11 @@ export function mapRssItem(item: any, sourceLabel: string): RawHeadline | null {
 
 async function fetchSecondary(): Promise<RawHeadline[]> {
   return withConnectorHealth(SECONDARY_KEY, async () => {
-    const res = await fetch(FOREXLIVE_RSS_URL, { headers: { accept: "application/rss+xml, application/xml, text/xml" }, cache: "no-store" });
+    const res = await fetchWithTimeout(
+      FOREXLIVE_RSS_URL,
+      { headers: { accept: "application/rss+xml, application/xml, text/xml" }, cache: "no-store" },
+      8000
+    );
     if (!res.ok) throw new Error(`ForexLive RSS HTTP ${res.status}`);
     const xml = await res.text();
     const parsed = xmlParser.parse(xml);

@@ -1,5 +1,5 @@
 import { TRADABLE_UNIVERSE } from "../universe";
-import { getRecentStories, saveSignal } from "../db/repository";
+import { getRecentStories, saveSignal, saveEngineTickSummary } from "../db/repository";
 import { decayedSeverity, currentDecayFactor } from "../news/decay";
 import { getMarketDataConnector } from "../ingestion/marketData";
 import { buildTechnicalReadout } from "../technical/indicators";
@@ -9,11 +9,14 @@ import { computeMacroRegime, marketRegimeScore as regimeScoreOf } from "../regim
 import { buildSignal } from "../signals/signalBuilder";
 import { rankOpportunities } from "../scoring/rank";
 import { computeDataQualityScore, swingRequiredSources } from "../dataQuality/dataQualityEngine";
-import type { Direction, MacroRegime, MacroSnapshot, NewsStory, TradeSignal } from "../types";
+import { getConnectorHealthFor } from "../ingestion/connectorHealth";
+import type { Direction, MacroRegime, MacroSnapshot, NewsStory, TickStatus, TradeSignal } from "../types";
 
 const MIN_DECAYED_SEVERITY_TO_CONSIDER = 15;
 
 export interface SwingEngineResult {
+  tickStatus: Exclude<TickStatus, "LOADING">;
+  tickAtUtc: string;
   regimeSummary: string;
   centralBankBias: string;
   activeThemes: string[];
@@ -33,7 +36,9 @@ export async function runSwingEngine(now: Date = new Date()): Promise<SwingEngin
     regime = computeMacroRegime(macro);
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    return {
+    const result: SwingEngineResult = {
+      tickStatus: "DATA_UNAVAILABLE",
+      tickAtUtc: new Date().toISOString(),
       regimeSummary: `Regime unavailable: ${reason}`,
       centralBankBias: "unavailable",
       activeThemes: [],
@@ -42,6 +47,8 @@ export async function runSwingEngine(now: Date = new Date()): Promise<SwingEngin
       suppressed: [],
       noIdeaReasons: TRADABLE_UNIVERSE.map((i) => `${i.symbol}: required macro data unavailable (${reason}).`),
     };
+    saveEngineTickSummary("SWING", result.tickStatus, result);
+    return result;
   }
 
   const allStories = getRecentStories(80);
@@ -112,6 +119,12 @@ export async function runSwingEngine(now: Date = new Date()): Promise<SwingEngin
     )[0];
 
     const dataQuality = computeDataQualityScore(swingRequiredSources(instrument.symbol));
+    const usesSampleData = dataQuality.breakdown.some((b) => b.status === "sample");
+    const provenance = dataQuality.breakdown.map((b) => ({
+      sourceKey: b.sourceKey,
+      status: b.status,
+      detail: getConnectorHealthFor(b.sourceKey)?.detail ?? "no fetch attempted yet this session",
+    }));
 
     const signal = buildSignal({
       engine: "SWING",
@@ -127,6 +140,8 @@ export async function runSwingEngine(now: Date = new Date()): Promise<SwingEngin
       upcomingRisks: [],
       newsImpactScore: aggregateImpact,
       dataQualityScore: dataQuality.score,
+      usesSampleData,
+      provenance,
       now,
     });
 
@@ -136,7 +151,11 @@ export async function runSwingEngine(now: Date = new Date()): Promise<SwingEngin
 
   const { ranked, suppressed } = rankOpportunities(candidates);
 
-  return {
+  const degraded = noIdeaReasons.some((r) => r.includes("market data unavailable"));
+
+  const result: SwingEngineResult = {
+    tickStatus: degraded ? "DEGRADED" : "READY",
+    tickAtUtc: new Date().toISOString(),
     regimeSummary: regime.summary,
     centralBankBias: `${regime.rateBias} (confidence ${regime.regimeScore}/100)`,
     activeThemes,
@@ -145,6 +164,8 @@ export async function runSwingEngine(now: Date = new Date()): Promise<SwingEngin
     suppressed: suppressed.map((s) => ({ instrument: s.signal.instrument, reason: s.reason })),
     noIdeaReasons,
   };
+  saveEngineTickSummary("SWING", result.tickStatus, result);
+  return result;
 }
 
 function aggregateInstrumentImpact(
