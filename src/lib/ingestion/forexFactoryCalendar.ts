@@ -96,7 +96,11 @@ function round(n: number, unit: string): number {
   return Math.round(n * 10 ** decimals) / 10 ** decimals;
 }
 
-class SampleCalendarConnector implements CalendarConnector {
+/** Exported for reuse by the Trading Intelligence Engine's own ingestion —
+ * same sample-fixture generator, used only as the development-mode
+ * fallback when the live feed is unreachable (see resolveLiveOrSample in
+ * ti/db/dataSources.ts). */
+export class SampleCalendarConnector implements CalendarConnector {
   async fetchUpcoming(hoursAhead = 24): Promise<EconomicEvent[]> {
     const events: EconomicEvent[] = [];
     for (let h = 1; h <= hoursAhead; h += 3) events.push(sampleEventAt(h));
@@ -124,7 +128,7 @@ class SampleCalendarConnector implements CalendarConnector {
  * point at a different (e.g. a licensed Flex Account) export instead — see
  * src/lib/ingestion/README.md.
  */
-const DEFAULT_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
+export const DEFAULT_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
 
 /** Values arrive as strings with embedded units: "180K", "3.2%", "-1.5M",
  * "<0.1%", "  " (blank = not yet released), "4.50%-4.75%" (range — takes the
@@ -189,7 +193,11 @@ export function mapFairEconomyRow(row: any): EconomicEvent | null {
   };
 }
 
-async function fetchFairEconomyCalendar(url: string): Promise<EconomicEvent[]> {
+/** Exported for reuse by the Trading Intelligence Engine's own ingestion
+ * (src/lib/ti/ingestion/calendar.ts), which wraps this in its own
+ * Postgres-backed health tracking rather than this file's SQLite-backed
+ * one — the HTTP fetch + FF JSON parsing logic is identical either way. */
+export async function fetchFairEconomyCalendar(url: string): Promise<EconomicEvent[]> {
   const res = await fetchWithTimeout(url, { headers: { accept: "application/json" }, cache: "no-store" }, 8000);
   if (!res.ok) throw new Error(`Calendar feed HTTP ${res.status}`);
   const rows = (await res.json()) as any[];

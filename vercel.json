@@ -1,6 +1,7 @@
 {
   "crons": [
     { "path": "/api/cron/tick", "schedule": "*/5 * * * *" },
-    { "path": "/api/premarket/capture", "schedule": "45 13 * * 1-5" }
+    { "path": "/api/premarket/capture", "schedule": "45 13 * * 1-5" },
+    { "path": "/api/ti/cron/tick", "schedule": "*/5 * * * *" }
   ]
 }

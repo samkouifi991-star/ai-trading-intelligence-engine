@@ -11,6 +11,11 @@ export const PROVIDER_SYMBOLS: Record<string, { yahoo: string; twelvedata: strin
   USDJPY: { yahoo: "USDJPY=X", twelvedata: "USD/JPY" },
   USDCAD: { yahoo: "USDCAD=X", twelvedata: "USD/CAD" },
   AUDUSD: { yahoo: "AUDUSD=X", twelvedata: "AUD/USD" },
+  // Trading Intelligence Engine's currency-strength/universe additions:
+  USDCHF: { yahoo: "USDCHF=X", twelvedata: "USD/CHF" },
+  NZDUSD: { yahoo: "NZDUSD=X", twelvedata: "NZD/USD" },
+  EURJPY: { yahoo: "EURJPY=X", twelvedata: "EUR/JPY" },
+  GBPJPY: { yahoo: "GBPJPY=X", twelvedata: "GBP/JPY" },
   DXY: { yahoo: "DX-Y.NYB", twelvedata: "DXY" },
   VIX: { yahoo: "^VIX", twelvedata: "VIX" },
   // Treasury futures — the real-time rate-pressure proxy (see ratePressure.ts).

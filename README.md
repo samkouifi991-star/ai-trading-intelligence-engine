@@ -7,7 +7,142 @@ app, its own database, its own environment variables and deployment. It has
 no dependency on, and shares no code, database, or deployment with, any
 other project.
 
-## The core design principle, and how the code enforces it
+## Trading Intelligence Engine rebuild — Phase 1 (current)
+
+This repo is being rebuilt into a broader "continuously rank the best
+FX/gold trading opportunities right now" platform (economic surprise
+scoring, currency strength, news intelligence, technical/cross-market
+confirmation, trader consensus, a final trade-ranking engine, backtesting —
+see the full spec's 30 sections). It's being built in the 6 phases the spec
+itself lays out, one verified phase at a time, reusing this repo's existing
+ingestion connectors and safety patterns (`APP_MODE`, connector-health
+tracking, `DataUnavailableError`, sample-data labeling) rather than starting
+over. **This is a different phase sequence from the "Phase 2/3" headers
+below**, which describe the original two-engine (Day/Swing) product's own
+build history — that product still exists, still works, and is now labeled
+"(legacy)" in the nav while this rebuild supersedes it.
+
+New code lives under `src/lib/ti/` and the `/opportunities` dashboard
+(now the app's default landing page); the legacy Day/Swing engine is
+untouched and still runs on its own SQLite file.
+
+**What Phase 1 actually delivers:**
+
+- **Database**: a new Postgres schema (`supabase/migrations/0001_trading_intelligence_schema.sql`),
+  designed to live in the user's *existing* Supabase project inside its own
+  `trading_intel` Postgres schema — never touching, reading, or writing any
+  other application's tables in that project (isolation is at the schema
+  level, not just table-name prefixing). All 26 tables the full spec needs
+  are created now (economic events/surprises, news, narratives, currency
+  strength, market prices/candles, technical/cross-market/reaction scores,
+  trader intelligence, market regimes, trade candidates/recommendations/
+  outcomes, system weights, data-source health, AI analysis logs) so later
+  phases never need a schema-churning migration — but only the Phase-1-
+  relevant tables are populated today; the rest sit empty and ready.
+- **Market data**: reuses the legacy engine's `MarketDataProvider`
+  abstraction (Yahoo/Twelve Data) unchanged; extended the symbol mapping
+  and universe to the spec's 10 starting markets (EURUSD, GBPUSD, USDJPY,
+  USDCHF, AUDUSD, NZDUSD, USDCAD, EURJPY, GBPJPY, XAUUSD — architected so
+  indices/silver/oil/crypto slot in later via the same `TI_UNIVERSE` table,
+  see `src/lib/ti/universe.ts`).
+- **Forex Factory Calendar ingestion**: reuses the legacy engine's real,
+  live, keyless FairEconomy JSON connector as-is; wraps it in the new
+  system's own Postgres-backed connector-health tracking
+  (`src/lib/ti/db/dataSources.ts`) rather than the legacy SQLite one.
+- **Economic Surprise Engine v2**: still never scores `actual - forecast`
+  directly — every surprise is a z-score against that indicator's own
+  accumulating historical distribution (built from real ingested releases,
+  bootstrapped from a documented catalog prior only when there isn't yet
+  enough history), blended with the revision-to-previous surprise, resolved
+  to hawkish/dovish via the indicator's known polarity, scaled by Forex
+  Factory's impact level, and normalized to the spec's single -100..+100
+  per-currency scale. Every computed score is persisted with its full
+  component breakdown (`trading_intel.economic_surprises`) for audit.
+- **Currency Strength Engine**: real -100..100 scores for all 8 currencies,
+  built from whatever components are genuinely wired this tick — recent
+  economic surprises, live price action across every pair touching that
+  currency, a VIX-driven safe-haven/risk-currency read, and (USD only) a
+  real FRED 2Y/10Y yield-change component. **News and central-bank
+  components are structurally present in the schema/type but explicitly
+  return `not_available_yet` and are excluded from the weighted average**
+  — never silently blended in as a fake neutral 0 (which would just dilute
+  every score toward zero). Every component that touches a legacy-engine
+  data source (VIX, FRED) double-checks that source's *actual* last-fetch
+  status before trusting it, so a legacy-side sample-mode fallback can
+  never silently feed a "real" score in the new system.
+- **Basic dashboard** (`/opportunities`): currency strength bars with a
+  per-component breakdown, a real-time data-source status table, and a
+  recent/upcoming economic releases feed with surprise scores — all with
+  the same dev-mode banner and "Sample Data" badging as the legacy
+  dashboards, and a clear "database not configured" state instead of a
+  crash when `DATABASE_URL` is unset.
+- **Egress-consciousness, built in from the start** (per explicit
+  instruction, since the target Supabase project has already exceeded its
+  Free-plan egress quota): every read route uses selective columns and
+  bounded windows/limits, never `SELECT *` over a growing table; the 8
+  currencies' latest strength read as one indexed `DISTINCT ON` query, not
+  8 round trips; "current" values also write through a tiny single-row-per-
+  key cache table (`trading_intel.latest_values`) rather than requiring a
+  history-table scan on every read; the economic-surprise scoring job
+  cools down 6h per event so an unchanged release isn't re-scored (and
+  rewritten) on every 5-minute tick; no Realtime subscriptions, no
+  client-side polling of anything but small cached values.
+
+**What's genuinely live vs. mocked right now:** identical to the legacy
+engine's honesty rules — every source's `connector_health`-equivalent row
+reflects its actual last attempt, sample-mode fallback is only ever used in
+`APP_MODE=development` and is labeled everywhere it can reach the UI
+(`SampleDataBadge`, `isSampleSource` on both signals and calendar events).
+In *this* sandboxed dev environment, live network egress is blocked (same
+restriction documented throughout this README already), so every source
+shows `blocked`/sample here — that is the correct, honest behavior, not a
+bug; a real deployment with real internet access should show `live` for
+the calendar and market-data sources. Verified locally end-to-end against
+a real local Postgres 16 instance (schema applies cleanly and
+idempotently; ingestion, scoring, and the dashboard all round-trip
+correctly) — see the credentials checklist below for what's required to
+point this at the real Supabase project.
+
+**What's explicitly blocked / not attempted, and why:**
+
+- **Trader intelligence (spec sections 6-7)**: Forex Factory has no public
+  API for individual trader performance or Trade Explorer data, and
+  scraping personal trader accounts is far more legally/technically fragile
+  than the news/calendar scraping already built. The full schema exists
+  (`traders`, `trader_performance`, `trader_expertise`, `trader_positions`,
+  `trader_consensus`) but nothing populates it — per the user's own
+  decision, this stays `DATA UNAVAILABLE` until a real, legitimate source
+  is identified.
+- **Non-USD sovereign yields**: FRED gives free daily USD 2Y/10Y yields
+  (already wired); EUR/GBP/JPY/CHF/CAD/AUD/NZD equivalents are real,
+  separate data sources this build does not have wired yet — their yield
+  component reads `not_available_yet` rather than a fabricated proxy.
+- **News/central-bank currency-strength components**: Phase 2 (news
+  classification + narrative memory) hasn't been built yet — these read
+  `not_available_yet` by design, not a bug.
+- **Redis**: deferred per explicit choice; `trading_intel.latest_values` is
+  the real cache backing store today (see `src/lib/ti/cache/cache.ts`),
+  behind the same `getCached`/`setCached` interface a real Redis client
+  would need, so swapping it in later touches no caller.
+
+**Environment variables this phase needs:** `DATABASE_URL` (your Supabase
+project's Postgres connection string — see the credentials checklist
+below) is the only new one; everything else (`MARKET_DATA_PROVIDER`,
+`TWELVE_DATA_API_KEY`, `FOREX_FACTORY_CALENDAR_URL`, `CRON_SECRET`,
+`APP_MODE`) is shared with the legacy engine and already documented there.
+
+**Assumptions made (stated plainly, all adjustable):** the component
+weights (economic 40% / price action 30% / risk 20% / yield 10%,
+renormalized over whatever's actually available) and the three scale
+constants (`PRICE_ACTION_SCALE`, `VIX_RISK_SCALE`, `YIELD_SCALE` in
+`src/lib/ti/scoring/currencyStrength.ts`) are documented starting points,
+not calibrated/backtested values — Phase 6's backtesting is exactly what
+should eventually replace them with data-driven weights (spec section 22's
+`system_weights` table already exists for this). USD/JPY/CHF are treated
+as safe havens and AUD/NZD/CAD as risk-linked per standard FX convention;
+EUR/GBP are deliberately left unclassified rather than guessed.
+
+
 
 **The LLM explains news. It never decides whether to trade.** Every score,
 every decay curve, every threshold, and the final TRADE/WATCH/NO_TRADE status
@@ -380,13 +515,22 @@ everything gates a genuinely-live deployment the same way.
 **REQUIRED NOW** — without these, the deployment cannot be a real
 production instance, regardless of how many data sources are live:
 
-- `CRON_SECRET` — a random string. Without it, `/api/cron/tick` and
-  `/api/premarket/capture` are publicly callable by anyone with the URL.
-- A real network database + a `src/lib/db/db.ts`/`repository.ts`
-  reimplementation against it (see "Deploying to Vercel" above) — the
-  default `TRADING_DB_PATH=/tmp/trading.db` is wiped on every cold start and
-  is verification-only, never production storage.
-- `APP_MODE=production` — set only once the above two are done. This is the
+- `CRON_SECRET` — a random string. Without it, `/api/cron/tick`,
+  `/api/premarket/capture`, and `/api/ti/cron/tick` are publicly callable by
+  anyone with the URL.
+- **For the legacy Day/Swing engine**: a real network database + a
+  `src/lib/db/db.ts`/`repository.ts` reimplementation against it (see
+  "Deploying to Vercel" above) — the default `TRADING_DB_PATH=/tmp/trading.db`
+  is wiped on every cold start and is verification-only, never production
+  storage.
+- **For the new Trading Intelligence Engine** (`/opportunities`,
+  `src/lib/ti/*`): `DATABASE_URL` — your Supabase project's Postgres
+  connection string (the "Transaction" pooler URI, port 6543, for
+  serverless compatibility). Already implemented against real Postgres, in
+  its own `trading_intel` schema — no reimplementation needed, just run
+  `supabase/migrations/0001_trading_intelligence_schema.sql` against your
+  project once and set this variable.
+- `APP_MODE=production` — set only once the above are done. This is the
   single switch that turns off sample-data fallback entirely (spec rule 5);
   leaving it at `development` in a "production" deployment is the one
   configuration mistake that defeats every other safety mechanism in this

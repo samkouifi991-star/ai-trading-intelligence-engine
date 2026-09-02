@@ -19,6 +19,15 @@ import { parseForexFactoryNewsHtml } from "../src/lib/ingestion/forexFactoryNews
 import { buildReactionReport } from "../src/lib/pipeline/eventClock";
 import { saveEventClockSnapshot, upsertNewsStory } from "../src/lib/db/repository";
 import type { NewsStory, TradeSignal } from "../src/lib/types";
+import { computeSurpriseCurrencyScore, resolveDirectionality } from "../src/lib/ti/scoring/surpriseEngine";
+import {
+  weightedRecencyAverage,
+  computePriceActionComponent,
+  computeRiskComponent,
+  computeYieldComponent,
+  combineWeightedComponents,
+} from "../src/lib/ti/scoring/currencyStrength";
+import type { EconomicEvent } from "../src/lib/types";
 
 let passed = 0;
 function test(name: string, fn: () => void) {
@@ -509,6 +518,158 @@ test("mapRssItem parses a realistic ForexLive-style RSS item (CDATA, HTML body, 
 
 test("mapRssItem returns null for an item missing a title or pubDate", () => {
   assert.equal(mapRssItem({ link: "https://x.test" }, "source"), null);
+});
+
+console.log("\nTrading Intelligence Engine: Economic Surprise scoring formula");
+test("computeSurpriseCurrencyScore: null z scores 0 regardless of directionality", () => {
+  assert.equal(computeSurpriseCurrencyScore(null, "hawkish", 1), 0);
+});
+test("computeSurpriseCurrencyScore: mixed/unclear directionality scores 0 regardless of |z|", () => {
+  assert.equal(computeSurpriseCurrencyScore(5, "mixed", 1), 0);
+  assert.equal(computeSurpriseCurrencyScore(5, "unclear", 1), 0);
+});
+test("computeSurpriseCurrencyScore: hawkish z=1 at full impact weight is positive and ~55", () => {
+  const score = computeSurpriseCurrencyScore(1, "hawkish", 1);
+  assert.ok(score > 50 && score < 60, `got ${score}`);
+});
+test("computeSurpriseCurrencyScore: dovish z=1 at full impact weight is the negative mirror of hawkish", () => {
+  const hawkish = computeSurpriseCurrencyScore(1, "hawkish", 1);
+  const dovish = computeSurpriseCurrencyScore(1, "dovish", 1);
+  assert.equal(dovish, -hawkish);
+});
+test("computeSurpriseCurrencyScore: low-impact (0.3 weight) release scores lower magnitude than high-impact (1.0) for the same z", () => {
+  const high = Math.abs(computeSurpriseCurrencyScore(2, "hawkish", 1));
+  const low = Math.abs(computeSurpriseCurrencyScore(2, "hawkish", 0.3));
+  assert.ok(low < high, `low=${low} should be < high=${high}`);
+});
+test("computeSurpriseCurrencyScore: an enormous surprise clamps at +/-100, never exceeds the spec's scale", () => {
+  assert.equal(computeSurpriseCurrencyScore(50, "hawkish", 1), 100);
+  assert.equal(computeSurpriseCurrencyScore(50, "dovish", 1), -100);
+});
+
+console.log("\nTrading Intelligence Engine: directionality resolution (never actual>forecast=bullish)");
+const CPI_EVENT: EconomicEvent = {
+  id: "e1", event: "Core CPI m/m", currency: "USD", eventTimeUtc: new Date().toISOString(),
+  impact: "high", actual: 0.4, forecast: 0.3, previous: 0.3, revisedPrevious: null,
+  source: "Forex Factory Calendar", description: "",
+};
+const UNEMPLOYMENT_EVENT: EconomicEvent = { ...CPI_EVENT, id: "e2", event: "Unemployment Rate" };
+const RETAIL_SALES_EVENT: EconomicEvent = { ...CPI_EVENT, id: "e3", event: "Retail Sales m/m" };
+
+test("resolveDirectionality: null z (no actual/forecast pair) is unclear", () => {
+  assert.equal(resolveDirectionality(CPI_EVENT, null, null).directionality, "unclear");
+});
+test("resolveDirectionality: |z| within the noise band (<0.15) is mixed even for a higher_hawkish indicator", () => {
+  assert.equal(resolveDirectionality(CPI_EVENT, 0.1, null).directionality, "mixed");
+});
+test("resolveDirectionality: CPI beat (higher_hawkish, positive z) reads hawkish", () => {
+  assert.equal(resolveDirectionality(CPI_EVENT, 1.2, null).directionality, "hawkish");
+});
+test("resolveDirectionality: CPI miss (higher_hawkish, negative z) reads dovish", () => {
+  assert.equal(resolveDirectionality(CPI_EVENT, -1.2, null).directionality, "dovish");
+});
+test("resolveDirectionality: Unemployment Rate HIGHER than expected (higher_dovish polarity) reads dovish, not hawkish — never a naive actual>forecast=bullish shortcut", () => {
+  assert.equal(resolveDirectionality(UNEMPLOYMENT_EVENT, 1.2, null).directionality, "dovish");
+});
+test("resolveDirectionality: Unemployment Rate LOWER than expected reads hawkish", () => {
+  assert.equal(resolveDirectionality(UNEMPLOYMENT_EVENT, -1.2, null).directionality, "hawkish");
+});
+test("resolveDirectionality: context_dependent indicator (Retail Sales) with no regime context is mixed, not guessed", () => {
+  assert.equal(resolveDirectionality(RETAIL_SALES_EVENT, 1.2, null).directionality, "mixed");
+});
+test("resolveDirectionality: context_dependent indicator becomes rate-path-relevant only when a hawkish regime is supplied", () => {
+  const withRegime = resolveDirectionality(RETAIL_SALES_EVENT, 1.2, "Rate bias: hawkish");
+  assert.equal(withRegime.directionality, "hawkish");
+});
+
+console.log("\nTrading Intelligence Engine: Currency Strength Engine component formulas");
+test("weightedRecencyAverage: empty input scores 0, not a division-by-zero crash", () => {
+  assert.equal(weightedRecencyAverage([]), 0);
+});
+test("weightedRecencyAverage: a single fresh release returns exactly its own score", () => {
+  assert.equal(weightedRecencyAverage([{ currencyScore: 42, ageHours: 0 }]), 42);
+});
+test("weightedRecencyAverage: a fresh release outweighs a stale one of the opposite sign", () => {
+  const score = weightedRecencyAverage([
+    { currencyScore: 100, ageHours: 0 },
+    { currencyScore: -100, ageHours: 70 }, // near the 72h floor, weight bottoms out at 0.1
+  ]);
+  assert.ok(score > 50, `expected the fresh release to dominate, got ${score}`);
+});
+
+const usdPrice = (symbol: string, changePct: number, provider = "yahoo") => ({
+  symbol, bid: null, ask: null, last: 1, spread: null, changePct, provider, realtime: false, updatedAtUtc: new Date(),
+});
+
+test("computePriceActionComponent: EURUSD rising means USD weakening (USD is the quote currency, so direction flips)", () => {
+  const result = computePriceActionComponent("USD" as any, [usdPrice("EURUSD", 0.5)]);
+  assert.equal(result.status, "available");
+  assert.equal(result.score, Math.round(-0.5 * 80));
+  assert.ok(result.score < 0, "EURUSD up should read as USD strength going down");
+});
+test("computePriceActionComponent: USDJPY rising means USD strengthening (USD is the base currency)", () => {
+  const result = computePriceActionComponent("USD" as any, [usdPrice("USDJPY", 0.5)]);
+  assert.ok(result.score > 0, "USDJPY up should read as USD strength going up");
+});
+test("computePriceActionComponent: sample-provider prices are excluded, never silently scored as real", () => {
+  const result = computePriceActionComponent("USD" as any, [usdPrice("EURUSD", 0.5, "sample")]);
+  assert.equal(result.status, "not_available_yet");
+  assert.deepEqual(result.pairsUsed, []);
+});
+test("computePriceActionComponent: no matching prices at all is not_available_yet, never a fabricated 0-as-real", () => {
+  const result = computePriceActionComponent("USD" as any, []);
+  assert.equal(result.status, "not_available_yet");
+});
+
+test("computeRiskComponent: null VIX change is not_available_yet", () => {
+  assert.equal(computeRiskComponent("USD" as any, null, true).status, "not_available_yet");
+});
+test("computeRiskComponent: VIX's own last fetch being sample data excludes it from scoring even if a number is present", () => {
+  assert.equal(computeRiskComponent("USD" as any, 3, false).status, "not_available_yet");
+});
+test("computeRiskComponent: a currency with no clear haven/risk-linked classification is not_available_yet (EUR is deliberately not guessed)", () => {
+  assert.equal(computeRiskComponent("EUR" as any, 3, true).status, "not_available_yet");
+});
+test("computeRiskComponent: rising VIX (risk-off) is positive for a safe haven (USD)", () => {
+  const result = computeRiskComponent("USD" as any, 2, true);
+  assert.equal(result.status, "available");
+  assert.ok(result.score > 0, `expected positive, got ${result.score}`);
+});
+test("computeRiskComponent: rising VIX (risk-off) is negative for a risk-linked currency (AUD) — the mirror image of a haven", () => {
+  const haven = computeRiskComponent("USD" as any, 2, true).score;
+  const riskLinked = computeRiskComponent("AUD" as any, 2, true).score;
+  assert.equal(riskLinked, -haven);
+});
+
+test("computeYieldComponent: only USD has a real wired feed — every other currency is not_available_yet, never a fabricated proxy", () => {
+  assert.equal(computeYieldComponent("EUR" as any, 3, 5, true).status, "not_available_yet");
+});
+test("computeYieldComponent: USD with a genuinely live FRED fetch scores from the real 2Y/10Y bps change", () => {
+  const result = computeYieldComponent("USD" as any, 3, 5, true);
+  assert.equal(result.status, "available");
+  assert.equal(result.score, Math.round(((3 + 5) / 2) * 10));
+});
+test("computeYieldComponent: USD but FRED's last fetch failed is not_available_yet, never scored on stale data", () => {
+  assert.equal(computeYieldComponent("USD" as any, 3, 5, false).status, "not_available_yet");
+});
+
+console.log("\nTrading Intelligence Engine: weighted component combination (renormalizes over what's actually available)");
+test("combineWeightedComponents: no available components scores 0, not a division-by-zero crash", () => {
+  assert.equal(combineWeightedComponents([]), 0);
+});
+test("combineWeightedComponents: a single available component is renormalized to its own full weight (its score passes through)", () => {
+  assert.equal(combineWeightedComponents([{ key: "economic", score: 50 }]), 50);
+});
+test("combineWeightedComponents: two components blend proportionally to their relative weights", () => {
+  // economic (0.4)=50, priceAction (0.3)=-20 -> (50*0.4 + -20*0.3) / (0.4+0.3) = 20
+  const result = combineWeightedComponents([
+    { key: "economic", score: 50 },
+    { key: "priceAction", score: -20 },
+  ]);
+  assert.equal(result, 20);
+});
+test("combineWeightedComponents: clamps to the spec's -100..100 scale even if a component score were out of range", () => {
+  assert.equal(combineWeightedComponents([{ key: "economic", score: 500 }]), 100);
 });
 
 console.log(`\n${passed} test(s) passed.`);
