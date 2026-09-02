@@ -142,7 +142,29 @@ should eventually replace them with data-driven weights (spec section 22's
 as safe havens and AUD/NZD/CAD as risk-linked per standard FX convention;
 EUR/GBP are deliberately left unclassified rather than guessed.
 
+**Real-Supabase verification**: the sandboxed environment this code was
+written in cannot reach Supabase at all — every host under
+`supabase.com`/`*.supabase.co` is rejected by that session's own egress
+policy (confirmed directly: 403/502 policy denials from the proxy itself,
+logged in `recentRelayFailures`; the same restriction that blocks Yahoo
+Finance/FRED/Forex Factory/Vercel throughout this README). No
+`DATABASE_URL`, however valid, changes that — the block is at the network
+layer, before credentials are ever checked. So the actual Supabase
+connection has to be verified from somewhere with real internet access —
+your Vercel deployment. `GET /api/ti/verify` (protected by `CRON_SECRET`
+if set, same bearer-token pattern as `/api/ti/cron/tick`) runs entirely
+server-side there and returns one structured report: live schema/index/
+constraint introspection straight from Postgres's own catalogs (never
+assumed from the migration file), before/after row counts across one real
+tick, current data-source health, one real (never sample-sourced —
+explicitly `null` if none exists yet, never fabricated) scored release,
+current currency strength, and an approximate app-measured read/write byte
+count for that one call (a proxy for Postgres traffic — not Supabase's own
+network-level egress metering, which this app has no API to read). Verified
+locally against a real local Postgres 16 instance before ever being pointed
+at Supabase — see the Phase 1 verification report for actual output.
 
+## The core design principle, and how the code enforces it
 
 **The LLM explains news. It never decides whether to trade.** Every score,
 every decay curve, every threshold, and the final TRADE/WATCH/NO_TRADE status

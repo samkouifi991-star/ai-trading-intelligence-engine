@@ -121,6 +121,44 @@ export async function getEventsWithSurpriseInRange(fromUtc: string, toUtc: strin
   }));
 }
 
+/** One real (never sample-sourced) scored release, most recent first — for
+ * verification reporting. Returns null (never a fabricated example) if
+ * nothing has been scored from a genuinely live calendar fetch yet. */
+export async function getExampleRealScoredRelease(): Promise<
+  (EconomicEventWithSurprise & {
+    currentSurpriseZ: number | null;
+    historicalMean: number;
+    historicalStdDev: number;
+    historicalSampleSize: number;
+    regimeAdjustedNote: string;
+  })
+  | null
+> {
+  const sql = getSql();
+  const rows = await sql<any[]>`
+    SELECT e.id, e.event, e.currency, e.country, e.event_time_utc, e.impact, e.actual, e.forecast, e.previous, e.revised_previous, e.source, e.description,
+           s.currency_score, s.directionality, s.is_sample_source, s.current_surprise_z, s.historical_mean, s.historical_std_dev, s.historical_sample_size, s.regime_adjusted_note
+    FROM trading_intel.economic_surprises s
+    JOIN trading_intel.economic_events e ON e.id = s.event_id
+    WHERE s.is_sample_source = false
+    ORDER BY s.computed_at_utc DESC
+    LIMIT 1
+  `;
+  const r = rows[0];
+  if (!r) return null;
+  return {
+    ...toEconomicEvent(r),
+    currencyScore: Number(r.currencyScore),
+    directionality: r.directionality,
+    isSampleSource: r.isSampleSource,
+    currentSurpriseZ: r.currentSurpriseZ === null ? null : Number(r.currentSurpriseZ),
+    historicalMean: Number(r.historicalMean),
+    historicalStdDev: Number(r.historicalStdDev),
+    historicalSampleSize: Number(r.historicalSampleSize),
+    regimeAdjustedNote: r.regimeAdjustedNote,
+  };
+}
+
 export interface IndicatorHistoryRow {
   indicatorKey: string;
   eventTimeUtc: Date;
